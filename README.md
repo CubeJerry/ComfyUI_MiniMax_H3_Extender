@@ -1,18 +1,11 @@
 # ComfyUI MiniMax H3 Extender
 
-## CubeJerry fork
+### Slight changes
 
-This fork builds on [tritant's MiniMax H3 Extender](https://github.com/tritant/ComfyUI_MiniMax_H3_Extender).
 
 In Ref2VA, leave **Motion Context ON** to mix continuations and cuts. Turn off **Use motion from previous clip** on the first card of a new shot. For example, clip 4 can start independently and clip 5 can continue from clip 4. Both run modes follow these switches. With a source video connected, the first card can also start independently of Clip 0. The source video still appears at the start of the export.
 
 Changing a switch reopens that clip and the clips after it. **Validated** accepts the cached take. A later unvalidated card can still generate when you queue the workflow. Global **Motion Context OFF** opens the independent editor, where you can retake individual clips. If the two cache owners contain conflicting takes and the Extender cannot establish their history, the switch stops and keeps both caches.
-
-The clip strip keeps its position while you edit a later card. CPU tests cover shot boundaries, checkpoint resume, project restoration, audio and video lengths, and card scrolling. Live ComfyUI and GPU generation checks are pending.
-
-**Updating a locally patched installation.** Save the current project as an `.ext` file. Stop ComfyUI and copy the node’s `cache/` directory to retain both motion modes. Commit or stash your local source edits before updating the fork. The changes are built in, so skip the old patch scripts. Restart ComfyUI and hard-refresh the browser. Older cards default to incoming motion ON. A matching legacy cache with a recorded zero-overlap cut can restore that cut. Decode repairs rebuild affected previews and audio from the saved latents.
-
-The upstream documentation and release notes follow below.
 
 ---
 
