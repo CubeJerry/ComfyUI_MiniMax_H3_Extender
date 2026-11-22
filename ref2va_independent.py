@@ -17,7 +17,7 @@ from pathlib import Path
 
 SEQUENCE_MODE = "ref2va_independent"
 INTERRUPT_MODE = "ref2va"
-BUILD = "ref2va-independent-v3.0.0"
+BUILD = "ref2va-independent-v3.2.0"
 
 
 def cache_owner_id(owner_id) -> str:
@@ -134,6 +134,8 @@ def compact_cache(owner_id, *, force=False):
                     item = dict(desc)
                     item["video"] = f._copy_cache_spec(src, dst, item["video"])
                     item["audio"] = f._copy_cache_spec(src, dst, item["audio"])
+                    item.pop("decoded_mp4_blob", None)
+                    item.pop("latent_end", None)
                     item["segment_end"] = int(dst.tell())
                     updated_segments[i] = item
                 dst.flush(); os.fsync(dst.fileno())
@@ -248,6 +250,9 @@ def store_segment(
     )
     if generation_seed is not None:
         desc["generation_seed"] = int(generation_seed)
+    desc["shot_decode_version"] = d.shots.SHOT_DECODE_VERSION
+    desc["generation_id"] = os.urandom(16).hex()
+    desc["incoming_motion_context"] = clip_index == 0
     desc["clip_id"] = clip_id
     desc["index"] = clip_index
     desc["trim_frames"] = 0

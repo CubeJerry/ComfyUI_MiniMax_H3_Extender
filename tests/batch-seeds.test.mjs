@@ -189,8 +189,9 @@ test("completion in another mode preserves each timeline's next seed", async () 
     `, f.context);
     f.queue();
     f.complete(submitted);
-    assert.equal(f.state().clips[0].seed, 11);
-    assert.equal(f.state().mode_clips.fl2va[0].seed, 71);
+    assert.equal(f.state().generation_mode, "fl2va");
+    assert.equal(f.state().mode_clips.ref2va[0].seed, 11);
+    assert.equal(f.state().clips[0].seed, 71);
 });
 
 

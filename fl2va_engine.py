@@ -1748,7 +1748,7 @@ def export_fl2va_final(
                 float(fps),
                 committed_path,
                 token,
-                source_meta=source_meta,
+                source_meta=source_meta, causal=False,
             )
             manifest = dict(manifest)
             manifest["preview_committed_count"] = len(segments)
@@ -1973,7 +1973,7 @@ def export_fl2va_final(
             float(fps),
             committed_path,
             token,
-            source_meta=source_meta,
+            source_meta=source_meta, causal=False,
         )
         manifest = dict(manifest)
         manifest["preview_committed_count"] = len(segments)

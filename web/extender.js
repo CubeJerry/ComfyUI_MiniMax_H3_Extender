@@ -531,6 +531,7 @@ async function persistLocalRefInvalidation(node, runtime, clipIndex, validatedSt
                 clip_index: index,
                 clip_id: String(runtime?.state?.clips?.[index]?.id || ""),
                 validated: Boolean(validatedState),
+                incoming_motion_context: runtime.state.clips[index]?.incoming_motion_context !== false,
                 dependent_clip_ids: fl2vaDependentClipIds,
             }),
         });
@@ -546,6 +547,46 @@ async function persistLocalRefInvalidation(node, runtime, clipIndex, validatedSt
     }
 }
 
+function advanceCacheEpoch(runtime) {
+    runtime.cacheStateEpoch = Number(runtime.cacheStateEpoch || 0) + 1;
+    runtime.cacheStateRequestRunning = false;
+}
+
+function clearCausalSuffix(runtime, index) {
+    invalidateFrom(runtime.state, index);
+    runtime.validatedCount = validatedPrefixFromState(runtime.state);
+    for (let i = index; i < runtime.state.clips.length; i++) {
+        const id = String(runtime.state.clips[i].id);
+        runtime.validatedClipIds?.delete(id);
+        runtime.computedClipIds?.delete(id);
+        runtime.computedIndices?.delete(i);
+    }
+}
+
+async function setIncomingMotion(node, runtime, index, value) {
+    const state = runtime.state;
+    const clip = state.clips[index];
+    if (!clip || projectBusy(runtime) || runtime.projectOperationBusy || randomAccessMode(state)) return;
+    advanceCacheEpoch(runtime);
+    const epoch = runtime.cacheStateEpoch;
+    runtime.motionEditBusy = true;
+    try {
+        if (clipHasPhysicalCache(runtime, clip, index)
+            && !(await persistLocalRefInvalidation(node, runtime, index))) return;
+        if (epoch !== runtime.cacheStateEpoch || state !== runtime.state || state.clips[index] !== clip) return;
+        legacyMotionCards.delete(clip);
+        clip.incoming_motion_context = value;
+        state.load_token = `${Date.now().toString(36)}_${randomSeed().toString(36)}`;
+        clearCausalSuffix(runtime, index);
+        snapshotModeValidation(runtime);
+        updateHidden(node, runtime);
+        captureNativeWorkflowState(node, runtime);
+    } finally {
+        runtime.motionEditBusy = false;
+        render(node, runtime);
+    }
+}
+
 async function prepareLocalRefMutation(node, runtime, clipIndex) {
     const index = Number(clipIndex);
     if (!Number.isInteger(index) || index < 0) return false;
@@ -553,6 +594,15 @@ async function prepareLocalRefMutation(node, runtime, clipIndex) {
     const isComputed = randomAccessMode(runtime?.state)
         ? runtime?.computedClipIds?.has(String(clip?.id || ""))
         : runtime?.computedIndices?.has(index);
+    if (!randomAccessMode(runtime.state)) {
+        advanceCacheEpoch(runtime);
+        const epoch = runtime.cacheStateEpoch;
+        if (clipHasPhysicalCache(runtime, clip, index)
+            && !(await persistLocalRefInvalidation(node, runtime, index))) return false;
+        if (epoch !== runtime.cacheStateEpoch) return false;
+        clearCausalSuffix(runtime, index);
+        return true;
+    }
     if (isComputed) {
         const ok = await discardComputedClip(node, runtime, index);
         if (!ok) return false;
@@ -562,8 +612,6 @@ async function prepareLocalRefMutation(node, runtime, clipIndex) {
         if (clip) clip.validated = false;
         runtime?.validatedClipIds?.delete(String(clip?.id || ""));
         if (wasValidated) runtime.validatedCount = Math.max(0, Number(runtime?.validatedCount || 0) - 1);
-    } else {
-        invalidateFrom(runtime.state, index);
     }
 
     // A future Ref2VA Motion-Context card may legitimately have local refs
@@ -1092,6 +1140,7 @@ function newClip(index) {
         seed_mode: "randomize",
         duration: 10.0,
         validated: false,
+        incoming_motion_context: true,
         color_adjustment: normalizeColorAdjustment(),
         loras: [],
         local_refs: emptyLocalRefs(),
@@ -1102,9 +1151,11 @@ function newClip(index) {
     };
 }
 
+const legacyMotionCards = new WeakSet();
+
 function normalizeClipList(rawClips) {
     const clips = Array.isArray(rawClips) && rawClips.length ? rawClips : [newClip(0)];
-    return clips.map((c, i) => ({
+    const normalized = clips.map((c, i) => ({
         id: String(c?.id || `clip_${i + 1}`),
         name: String(c?.name || ""),
         prompt: String(c?.prompt || ""),
@@ -1114,6 +1165,7 @@ function normalizeClipList(rawClips) {
             : "randomize",
         duration: Math.max(0.25, Math.min(150, Number(c?.duration || 10))),
         validated: Boolean(c?.validated),
+        incoming_motion_context: c?.incoming_motion_context !== false,
         color_adjustment: normalizeColorAdjustment(c?.color_adjustment),
         loras: normalizeClipLoras(c?.loras, c?.lora),
         local_refs: normalizeLocalRefs(c?.local_refs),
@@ -1124,6 +1176,10 @@ function normalizeClipList(rawClips) {
             ? "previous_clip"
             : "manual",
     }));
+    clips.forEach((c, i) => {
+        if (c && !Object.hasOwn(c, "incoming_motion_context")) legacyMotionCards.add(normalized[i]);
+    });
+    return normalized;
 }
 
 function blankModeClips() {
@@ -1384,7 +1440,7 @@ function validatedPrefixFromState(state) {
 }
 
 async function restoreCacheState(node, runtime) {
-    if (!node || !runtime || runtime.hydrating || runtime.cacheStateRequestRunning) return;
+    if (!node || !runtime || runtime.hydrating || projectBusy(runtime) || runtime.projectOperationBusy || runtime.cacheStateRequestRunning) return;
 
     const requestEpoch = Number(runtime.cacheStateEpoch || 0);
     runtime.cacheStateRequestRunning = true;
@@ -1452,10 +1508,28 @@ async function restoreCacheState(node, runtime) {
                 safePrefix = Math.min(safePrefix, commonPrefix);
                 runtime.cachedCount = Math.min(Number(runtime.cachedCount || 0), commonPrefix);
             }
-            runtime.validatedCount = safePrefix;
-            for (let i = 0; i < (runtime.state?.clips || []).length; i++) {
-                runtime.state.clips[i].validated = i < safePrefix;
+            const incoming = payload.recorded_incoming_motion || [];
+            const cards = runtime.state.clips;
+            for (let i = 0; i < runtime.cachedCount; i++) {
+                const card = cards[i];
+                if (card && cachedOrder[i] === card.id && legacyMotionCards.has(card) && typeof incoming[i] === "boolean") {
+                    card.incoming_motion_context = incoming[i];
+                    legacyMotionCards.delete(card);
+                }
             }
+            const incompatible = cards.findIndex((clip, i) =>
+                i >= runtime.cachedCount || (typeof incoming[i] === "boolean"
+                    && incoming[i] !== (clip.incoming_motion_context !== false)));
+            if (incompatible >= 0) {
+                runtime.computedIndices = new Set([...runtime.computedIndices].filter(i => i < incompatible));
+                if (cards.slice(incompatible).some(c => c.validated) || incompatible < safePrefix) {
+                    runtime.statusText = `Cached clip ${incompatible + 1} is missing or differs from this workflow. Review its validation before queuing.`;
+                    render(node, runtime);
+                    return;
+                }
+            }
+            runtime.validatedCount = safePrefix;
+            for (let i = 0; i < cards.length; i++) cards[i].validated = i < safePrefix;
         }
         snapshotModeValidation(runtime);
         runtime.jsonWidget.value = serializeState(runtime.state);
@@ -1481,7 +1555,7 @@ async function restoreCacheState(node, runtime) {
     } catch (_) {
         // Cache-state restoration is visual convenience only. Never block UI load.
     } finally {
-        runtime.cacheStateRequestRunning = false;
+        if (requestEpoch === Number(runtime.cacheStateEpoch || 0)) runtime.cacheStateRequestRunning = false;
     }
 }
 
@@ -1491,6 +1565,8 @@ async function discardComputedClip(node, runtime, clipIndex) {
     const clip = runtime.state?.clips?.[index];
     if (!clip || !Number.isInteger(index) || index < 0) return;
 
+    advanceCacheEpoch(runtime);
+    const epoch = runtime.cacheStateEpoch;
     runtime.discardComputedBusy = true;
     render(node, runtime);
     try {
@@ -1513,6 +1589,7 @@ async function discardComputedClip(node, runtime, clipIndex) {
             throw new Error(payload?.error || `Discard checkpoint failed (${response.status})`);
         }
 
+        if (epoch !== runtime.cacheStateEpoch) return false;
         runtime.cachedCount = Number(payload.cached_count || 0);
         runtime.validatedCount = Number(payload.validated_count || 0);
         runtime.cachedClipIds = new Set(Array.isArray(payload.cached_clip_ids) ? payload.cached_clip_ids.map(String) : []);
@@ -2341,18 +2418,6 @@ function restoreModeValidation(runtime, mode = null, motionContext = null) {
     return true;
 }
 
-function seedModeValidationFromCurrent(runtime, mode, motionContext, clips = null) {
-    if (!runtime?.state) return;
-    if (!runtime.modeValidationState) runtime.modeValidationState = {};
-    const key = validationStateKey(mode, motionContext);
-    const sourceClips = Array.isArray(clips) ? clips : (runtime.state?.clips || []);
-    runtime.modeValidationState[key] = new Map(
-        sourceClips.map((clip) => [String(clip?.id || ""), Boolean(clip?.validated)])
-    );
-    if (!runtime.modeValidationOrder) runtime.modeValidationOrder = {};
-    runtime.modeValidationOrder[key] = sourceClips.map((clip) => String(clip?.id || ""));
-}
-
 async function bootstrapRef2vaMotionToggleCache(node, runtime, nextMotionContext) {
     if (!node || !runtime?.state) return { ok: false, bootstrapped: false, found: false };
     if (String(runtime.state?.generation_mode || "ref2va") !== "ref2va") {
@@ -2366,6 +2431,7 @@ async function bootstrapRef2vaMotionToggleCache(node, runtime, nextMotionContext
         clips: (runtime.state?.clips || []).map((clip) => ({
             id: String(clip?.id || ""),
             validated: Boolean(clip?.validated),
+            incoming_motion_context: clip?.incoming_motion_context !== false,
         })),
     };
     try {
@@ -4691,6 +4757,7 @@ function setWidgetValue(node, name, value) {
 }
 
 function applyProjectPayload(node, runtime, projectPayload) {
+    advanceCacheEpoch(runtime);
     const extender = projectPayload?.extender || {};
     const settings = extender?.settings || {};
     if (typeof extender?.node_title === "string" && extender.node_title.trim()) {
@@ -4881,7 +4948,7 @@ function resetRuntimeForNewProject(node, runtime) {
 }
 
 function projectBusy(runtime) {
-    return ["preparing", "sampling", "refining", "complete"].includes(String(runtime?.activePhase || ""));
+    return Boolean(runtime?.motionEditBusy) || ["preparing", "sampling", "refining", "complete"].includes(String(runtime?.activePhase || ""));
 }
 
 function setProjectButtonsBusy(runtime, busy) {
@@ -5753,6 +5820,9 @@ function render(node, runtime) {
     const cardsScrollLeft = cards.scrollLeft;
     const cardsScrollTop = cards.scrollTop;
     const refsScrollLeft = runtime.refsRow?.scrollLeft || 0;
+    const refsScrollTop = runtime.refsRow?.scrollTop || 0;
+    const activeControl = document.activeElement;
+    const focusedMotionId = cards.contains?.(activeControl) && activeControl?.dataset.h3IncomingMotion;
     // render() rebuilds every card. Capture textarea-local UI state first so
     // long prompts do not jump back to the top after progress/status updates.
     capturePromptUiState(runtime);
@@ -5771,7 +5841,7 @@ function render(node, runtime) {
         runtime.motionButton.textContent = state.motion_context === false ? "MOTION: OFF" : "MOTION: ON";
         runtime.motionButton.title = state.motion_context === false
             ? "Independent Ref2VA clips: no Motion Context; reruns and edits stay targeted"
-            : "Causal Ref2VA chain: each clip receives Motion Context from the previous clip";
+            : "Sequential Ref2VA clips. Use each card’s incoming motion switch to start a new shot.";
     }
     const refineOn = boolValue(runtime.refineEnabledWidget?.value, false);
     const refineUiBusy = projectBusy(runtime);
@@ -6492,6 +6562,23 @@ function render(node, runtime) {
         row.append(seedBox, durBox);
         card.appendChild(row);
 
+        if (!randomAccess) {
+            const label = document.createElement("label");
+            const incoming = document.createElement("input");
+            incoming.type = "checkbox";
+            incoming.dataset.h3IncomingMotion = clip.id;
+            incoming.checked = clip.incoming_motion_context !== false;
+            const hasPrevious = index > 0 || Boolean(sourceVideo || runtime.continueVideoSocketConnected);
+            incoming.disabled = !hasPrevious || projectBusy(runtime) || runtime.projectOperationBusy;
+            label.title = hasPrevious
+                ? "Turn off to start a new shot. The next clip can still use this clip’s motion."
+                : "Clip 1 can use incoming motion when you connect a source video (Clip 0).";
+            incoming.addEventListener("change", () => setIncomingMotion(node, runtime, index, incoming.checked));
+            label.append(incoming, document.createTextNode(index === 0 && hasPrevious
+                ? "Use motion from Clip 0" : "Use motion from previous clip"));
+            card.appendChild(label);
+        }
+
         const foot = document.createElement("div");
         foot.style.display = "flex";
         foot.style.alignItems = "center";
@@ -6509,12 +6596,16 @@ function render(node, runtime) {
         validated.addEventListener("change", async () => {
             const wasValidated = Boolean(clip.validated);
             let persistValidation = false;
-            const fl2vaValidationSnapshot = fl2vaMode ? {
+            if (projectBusy(runtime) || runtime.projectOperationBusy) { validated.checked = wasValidated; return; }
+            advanceCacheEpoch(runtime);
+            const epoch = runtime.cacheStateEpoch;
+            const validationSnapshot = {
                 validated: (state.clips || []).map((item) => Boolean(item?.validated)),
+                validatedCount: runtime.validatedCount,
                 validatedClipIds: new Set(runtime.validatedClipIds || []),
                 computedClipIds: new Set(runtime.computedClipIds || []),
                 computedIndices: new Set(runtime.computedIndices || []),
-            } : null;
+            };
 
             if (randomAccess) {
                 // Random-access plans/clips validate independently, but a clip
@@ -6602,39 +6693,18 @@ function render(node, runtime) {
             if (persistValidation) {
                 const requestedValidated = Boolean(clip.validated);
                 validated.disabled = true;
-                const persisted = await persistLocalRefInvalidation(
-                    node, runtime, index, requestedValidated
-                );
+                runtime.motionEditBusy = true;
+                const persisted = await persistLocalRefInvalidation(node, runtime, index, requestedValidated);
+                runtime.motionEditBusy = false;
                 validated.disabled = false;
+                if (epoch !== runtime.cacheStateEpoch || runtime.state !== state) return;
                 if (!persisted) {
-                    if (fl2vaMode && fl2vaValidationSnapshot) {
-                        for (let i = 0; i < (state.clips || []).length; i++) {
-                            if (i < fl2vaValidationSnapshot.validated.length) {
-                                state.clips[i].validated = Boolean(fl2vaValidationSnapshot.validated[i]);
-                            }
-                        }
-                        runtime.validatedClipIds = new Set(fl2vaValidationSnapshot.validatedClipIds);
-                        runtime.computedClipIds = new Set(fl2vaValidationSnapshot.computedClipIds);
-                        runtime.computedIndices = new Set(fl2vaValidationSnapshot.computedIndices);
-                        runtime.validatedCount = runtime.validatedClipIds.size;
-                        validated.checked = Boolean(state.clips?.[index]?.validated);
-                    } else {
-                        clip.validated = wasValidated;
-                        validated.checked = wasValidated;
-                        if (independentRef2va) {
-                            if (wasValidated) runtime.validatedClipIds?.add(String(clip.id));
-                            else runtime.validatedClipIds?.delete(String(clip.id));
-                            runtime.validatedCount = runtime.validatedClipIds?.size || 0;
-                        } else {
-                            runtime.validatedCount = validatedPrefixFromState(state);
-                            runtime.validatedClipIds = new Set(
-                                (state.clips || [])
-                                    .slice(0, runtime.validatedCount)
-                                    .map((item) => String(item?.id || ""))
-                                    .filter(Boolean)
-                            );
-                        }
-                    }
+                    state.clips.forEach((item, i) => { item.validated = validationSnapshot.validated[i]; });
+                    runtime.validatedCount = validationSnapshot.validatedCount;
+                    runtime.validatedClipIds = validationSnapshot.validatedClipIds;
+                    runtime.computedClipIds = validationSnapshot.computedClipIds;
+                    runtime.computedIndices = validationSnapshot.computedIndices;
+                    validated.checked = wasValidated;
                     updateHidden(node, runtime);
                     captureNativeWorkflowState(node, runtime);
                     render(node, runtime);
@@ -6727,6 +6797,7 @@ function render(node, runtime) {
         card.appendChild(foot);
         cards.appendChild(card);
         restorePromptUiState(prompt, runtime, clip.id);
+        if (focusedMotionId === clip.id) card.querySelector("input[data-h3-incoming-motion]")?.focus({preventScroll:true});
     });
 
     // Restore after every card and prompt has been attached. The card strip
@@ -6737,6 +6808,7 @@ function render(node, runtime) {
     if (runtime.refsRow) {
         runtime.refsRow.scrollTo({
             left: fl2vaMode ? cards.scrollLeft : refsScrollLeft,
+            top: refsScrollTop,
             behavior: "instant",
         });
     }
@@ -7138,7 +7210,8 @@ function buildUi(node) {
     modeButton.title = "Switch between Ref2VA + Motion Context and independent FL2VA plans";
     modeButton.addEventListener("click", async (e) => {
         e.preventDefault();
-        if (projectBusy(runtime)) return;
+        if (projectBusy(runtime) || runtime.projectOperationBusy) return;
+        advanceCacheEpoch(runtime);
         const current = runtime.state.generation_mode === "fl2va" ? "fl2va" : "ref2va";
         const next = current === "fl2va" ? "ref2va" : "fl2va";
         const sourceActive = Boolean(runtime.continueVideoSocketConnected || activeContinueVideoDescriptor(runtime));
@@ -7197,62 +7270,44 @@ function buildUi(node) {
     motionButton.title = "Toggle Ref2VA Motion Context";
     motionButton.addEventListener("click", async (e) => {
         e.preventDefault();
-        if (projectBusy(runtime) || runtime.state?.generation_mode === "fl2va") return;
-
-        const nextMotionContext = runtime.state?.motion_context === false;
-        const sourceActive = Boolean(runtime.continueVideoSocketConnected || activeContinueVideoDescriptor(runtime));
-        let bootstrap = null;
-
-        if (sourceActive) {
-            try {
-                await invalidateContinueVideoModeCaches(
-                    node,
-                    runtime,
-                    "ref2va",
-                    nextMotionContext,
-                );
-            } catch (error) {
-                runtime.statusText = "Clip 0 Motion mode switch failed";
-                render(node, runtime);
-                alert(String(error?.message || error));
-                return;
-            }
-            invalidateAllGeneratedStateForContinueModeSwitch(runtime);
-            runtime.state.motion_context = nextMotionContext;
-            for (const clip of runtime.state.clips || []) clip.validated = false;
-        } else {
-            snapshotModeValidation(runtime);
-            const targetKey = validationStateKey("ref2va", nextMotionContext);
-            const hasTargetSnapshot = runtime?.modeValidationState?.[targetKey] instanceof Map;
+        if (projectBusy(runtime) || runtime.projectOperationBusy || runtime.state?.generation_mode === "fl2va") return;
+        const nextMotionContext = runtime.state.motion_context === false;
+        advanceCacheEpoch(runtime);
+        const epoch = runtime.cacheStateEpoch;
+        runtime.motionEditBusy = true;
+        let bootstrap;
+        try {
             bootstrap = await bootstrapRef2vaMotionToggleCache(node, runtime, nextMotionContext);
-            if (bootstrap?.bootstrapped && !hasTargetSnapshot) {
-                seedModeValidationFromCurrent(runtime, "ref2va", nextMotionContext);
-            }
-
-            runtime.state.motion_context = nextMotionContext;
-            // Motion ON and OFF keep separate physical caches, but the first
-            // switch without Clip 0 may inherit the existing rendered timeline.
-            if (!restoreModeValidation(runtime)) {
-                for (const clip of runtime.state.clips) clip.validated = false;
-            }
-            runtime.cachedClipIds = new Set();
-            runtime.validatedClipIds = new Set();
-            runtime.computedIndices = new Set();
-            runtime.computedClipIds = new Set();
-            runtime.checkpointActive = false;
-            runtime.checkpointInterrupted = false;
-            runtime.checkpointSnapshotCount = 0;
-            runtime.cachedCount = 0;
-            runtime.validatedCount = validatedPrefixFromState(runtime.state);
-            runtime.cacheStateRestored = false;
+        } finally {
+            runtime.motionEditBusy = false;
         }
-
-        motionContextWidget.value = runtime.state.motion_context !== false;
-        if (sourceActive) {
-            runtime.statusText = "Clip 0 kept • Motion mode changed • all generated clips invalidated";
-        } else if (bootstrap?.error) {
-            runtime.statusText = `Motion toggle cache bootstrap failed: ${bootstrap.error}`;
+        if (epoch !== runtime.cacheStateEpoch) return;
+        if (!bootstrap.ok) {
+            runtime.statusText = bootstrap.error || "Could not switch motion mode.";
+            render(node, runtime);
+            return;
         }
+        snapshotModeValidation(runtime);
+        runtime.state.motion_context = nextMotionContext;
+        runtime.state.load_token = `${Date.now().toString(36)}_${randomSeed().toString(36)}`;
+        const validatedIds = new Set(bootstrap.validated_ids || []);
+        for (const clip of runtime.state.clips) {
+            clip.validated = validatedIds.has(clip.id);
+            if (typeof bootstrap.incoming_updates?.[clip.id] === "boolean") {
+                clip.incoming_motion_context = bootstrap.incoming_updates[clip.id];
+            }
+        }
+        snapshotModeValidation(runtime);
+        runtime.cachedCount = Number(bootstrap.cached_count || 0);
+        runtime.cachedClipIds = new Set(runtime.state.clips.slice(0, runtime.cachedCount).map(c => c.id));
+        runtime.validatedClipIds = validatedIds;
+        runtime.validatedCount = validatedIds.size;
+        runtime.computedIndices = new Set();
+        runtime.computedClipIds = new Set();
+        runtime.checkpointActive = false;
+        runtime.cacheStateRestored = false;
+        runtime.statusText = nextMotionContext ? "Sequential motion enabled" : "Independent editing enabled";
+        motionContextWidget.value = nextMotionContext;
         updateHidden(node, runtime);
         captureNativeWorkflowState(node, runtime);
         render(node, runtime);
@@ -7888,7 +7943,10 @@ app.registerExtension({
         h3GraphConfiguring = true;
         for (const node of app.graph?._nodes || []) {
             if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
-            if (node.__h3Extender) node.__h3Extender.hydrating = true;
+            if (node.__h3Extender) {
+                advanceCacheEpoch(node.__h3Extender);
+                node.__h3Extender.hydrating = true;
+            }
         }
     },
 
@@ -8066,6 +8124,10 @@ app.registerExtension({
             if (!info) return;
 
             const mode = info.generation_mode || runtime.state.generation_mode || "ref2va";
+            if (mode !== runtime.state.generation_mode ||
+                (mode === "ref2va" && typeof info.motion_context === "boolean"
+                    && info.motion_context !== (runtime.state.motion_context !== false)) ||
+                (info.project_load_token !== undefined && info.project_load_token !== (runtime.state.load_token || ""))) return;
             const nextSeeds = new Map(
                 (runtime.state.mode_clips?.[mode] || [])
                     .filter((clip) => !clip.validated)
