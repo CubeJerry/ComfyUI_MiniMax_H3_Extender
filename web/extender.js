@@ -5748,6 +5748,11 @@ function restorePromptUiState(prompt, runtime, clipId) {
 
 function render(node, runtime) {
     const { state, cards, counter, status } = runtime;
+    // Emptying a scroll container can clamp its viewport back to zero during
+    // layout. Keep the strip position separately from textarea-local scroll.
+    const cardsScrollLeft = cards.scrollLeft;
+    const cardsScrollTop = cards.scrollTop;
+    const refsScrollLeft = runtime.refsRow?.scrollLeft || 0;
     // render() rebuilds every card. Capture textarea-local UI state first so
     // long prompts do not jump back to the top after progress/status updates.
     capturePromptUiState(runtime);
@@ -6723,6 +6728,18 @@ function render(node, runtime) {
         cards.appendChild(card);
         restorePromptUiState(prompt, runtime, clip.id);
     });
+
+    // Restore after every card and prompt has been attached. The card strip
+    // normally scrolls smoothly; restoration must be instant so it does not
+    // animate from the beginning. Do this synchronously so later user scrolls
+    // and intentional Add Clip / active-card navigation keep control.
+    cards.scrollTo({ left: cardsScrollLeft, top: cardsScrollTop, behavior: "instant" });
+    if (runtime.refsRow) {
+        runtime.refsRow.scrollTo({
+            left: fl2vaMode ? cards.scrollLeft : refsScrollLeft,
+            behavior: "instant",
+        });
+    }
 
     // Nodes 2.0 can recompute the DOM-widget grid after the Extender rebuilds
     // its cards (for example when toggling a Validated checkbox). During that

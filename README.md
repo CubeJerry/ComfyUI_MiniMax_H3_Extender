@@ -1,5 +1,17 @@
 # ComfyUI MiniMax H3 Extender
 
+## CubeJerry fork
+
+This fork builds on [tritant's MiniMax H3 Extender](https://github.com/tritant/ComfyUI_MiniMax_H3_Extender).
+
+The clip strip now keeps its scroll position when controls or status updates rebuild the cards. This fixes the jump back to the first clip when editing a long timeline. Add Clip still moves to the new card, and the FL2VA reference strip stays aligned. The change has automated regression coverage; live ComfyUI testing is pending.
+
+Per-clip incoming motion controls, cache handoff repairs, and reset-aware video/audio decoding are planned in the [Astra implementation handoff](docs/ASTRA_HANDOFF.md). Those backend changes are not yet included in this fork. The intended behavior is to keep global Motion Context ON, let a clip start independently, and let the next clip continue from that new output. Both `clip_by_clip` and `full_batch` must follow the same per-clip settings.
+
+The upstream documentation and release notes follow below.
+
+---
+
 A ComfyUI custom node for **MiniMax H3** designed to generate long, continuous video sequences from multiple clips while preserving motion, visual continuity, and audio continuity between generations.
 
 The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-clip generation, image references, audio references, and final video/audio decoding** into a much simpler workflow.
