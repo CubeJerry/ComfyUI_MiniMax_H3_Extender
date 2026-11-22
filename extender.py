@@ -54,6 +54,7 @@ from .latent_refine_engine import upscale_for_refine, preserve_first_pass_audio
 from .latent_upscaler import target_dimensions
 from .prompt_bridge import MAX_PROMPTS, PROMPT_PACK_TYPE, _prompt_pack_signature
 from .reference_bridge import MAX_REFERENCE_SLOTS, REF_PACK_TYPE
+from . import ref2va_cache as shots
 from .motion_context_disk import (
     CACHE_VERSION,
     CACHE_TYPE,
@@ -105,7 +106,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v3.1.1-RelayVSR"
+BUILD = "minimax-h3-extender-v3.2.0-shot-resets"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -2984,6 +2985,7 @@ def _default_clip(index: int = 0):
         "seed_mode": "randomize",
         "duration": DEFAULT_DURATION,
         "validated": False,
+        "incoming_motion_context": True,
         "color_adjustment": _normalize_color_adjustment(),
         "loras": [],
         "local_refs": _normalize_local_refs(None),
@@ -3068,6 +3070,7 @@ def _parse_clips_json(value: str, generation_mode="ref2va", motion_context=True)
                 "seed_mode": seed_mode,
                 "duration": duration,
                 "validated": bool(raw.get("validated", False)),
+                "incoming_motion_context": shots.card_motion(raw),
                 "color_adjustment": _normalize_color_adjustment(raw.get("color_adjustment")),
                 "loras": _normalize_clip_loras(raw.get("loras"), legacy=raw.get("lora")),
                 "local_refs": _normalize_local_refs(raw.get("local_refs")),
@@ -3577,9 +3580,8 @@ def _continue_resize_from_project_payload(project_payload):
     return _continue_resize_from_state(raw)
 
 
-def _clips_from_project_payload(project_payload):
+def _project_clips_json(project_payload):
     extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
-    generation_mode = _generation_mode_from_project_payload(project_payload)
     raw = extender.get("clips_json")
     if not isinstance(raw, str) or not raw.strip():
         settings = extender.get("settings", {}) if isinstance(extender, dict) else {}
@@ -3590,7 +3592,13 @@ def _clips_from_project_payload(project_payload):
             raw = json.dumps({"version": 1, "clips": clips}, ensure_ascii=False)
     if not isinstance(raw, str) or not raw.strip():
         raw = _state_json([_default_clip(0)])
-    return _parse_clips_json(raw, generation_mode, _motion_context_from_project_payload(project_payload))
+    return raw
+
+
+def _clips_from_project_payload(project_payload):
+    return _parse_clips_json(_project_clips_json(project_payload),
+                             _generation_mode_from_project_payload(project_payload),
+                             _motion_context_from_project_payload(project_payload))
 
 
 def _write_clips_to_project_payload(project_payload, clips, generation_mode=None):
@@ -3686,6 +3694,9 @@ def _project_cache_snapshot(owner_id, project_payload):
         clips = _clips_from_project_payload(project_payload)
     except Exception:
         clips = []
+    if not random_access:
+        shots.restore_legacy_cards(clips, _project_clips_json(project_payload), manifest)
+        shots.check_validated(data_path, manifest, clips)
     if random_access:
         order_by_id = {str(c.get("id")): i for i, c in enumerate(clips)}
         valid_by_id = {str(c.get("id")): bool(c.get("validated", False)) for c in clips}
@@ -3768,7 +3779,7 @@ def _project_cache_snapshot(owner_id, project_payload):
     preview_path = _decoded_preview_cache_path(data_path)
     preview_is_full = False
     final_meta = project_payload.get("final_decode")
-    if isinstance(final_meta, dict):
+    if not manifest.get("shot_preview_needs_rebuild") and isinstance(final_meta, dict):
         preview_meta = final_meta.get("preview")
         final_id = str(final_meta.get("node_id") or "").strip()
         if final_id and isinstance(preview_meta, dict) and bool(preview_meta.get("available", False)):
@@ -3803,7 +3814,7 @@ def _project_cache_snapshot(owner_id, project_payload):
         "data_path": data_path,
         "manifest_path": manifest_path,
         "audio_path": audio_path,
-        "preview_path": preview_path,
+        "preview_path": None if manifest.get("shot_preview_needs_rebuild") else preview_path,
         "preview_is_full": bool(preview_is_full),
         "manifest": manifest,
         "data_limit": data_limit,
@@ -4126,7 +4137,7 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             "present": snapshot is not None,
             "clip_count": int(len(snapshot["manifest"].get("segments", []))) if snapshot else 0,
             "frame_count": int(snapshot["manifest"].get("final_frame_count", 0)) if snapshot else 0,
-            "has_committed_preview": bool(snapshot and snapshot["preview_path"].exists()),
+            "has_committed_preview": bool(snapshot and snapshot["preview_path"] and snapshot["preview_path"].exists()),
             "has_portable_full_preview": bool(snapshot and snapshot.get("preview_is_full", False)),
             "has_decoded_audio_cache": bool(snapshot and int(snapshot.get("audio_limit", 0)) > 0),
             "relayvsr_x2": {
@@ -4250,7 +4261,7 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                     snapshot["audio_path"],
                     snapshot["audio_limit"],
                 )
-            if snapshot["preview_path"].exists():
+            if snapshot["preview_path"] and snapshot["preview_path"].exists():
                 zf.write(
                     snapshot["preview_path"],
                     arcname="cache/chain.preview.mp4",
@@ -4297,6 +4308,8 @@ def _replace_cache_transaction(
     new_relay_sidecar=None,
     generation_mode="ref2va",
     motion_context=True,
+    replace_source=False,
+    new_source=None,
 ):
     mode = _normalize_generation_mode(generation_mode)
     random_access = mode == "fl2va" or (mode == "ref2va" and not bool(motion_context))
@@ -4315,58 +4328,34 @@ def _replace_cache_transaction(
     # in .ext. The decoded-audio cache is primary cache data and is restored
     # together with the latent chain when present. RelayVSR belongs to this
     # project-specific cache too, so loading another project replaces it.
-    targets = [
-        target_data, target_manifest, target_preview, target_preview_video, target_audio,
-        target_relay_video, target_relay_sidecar,
-    ]
+    replacements = [(target_data, new_data), (target_manifest, new_manifest),
+                    (target_preview, new_preview), (target_preview_video, None),
+                    (target_audio, new_audio), (target_relay_video, new_relay_video),
+                    (target_relay_sidecar, new_relay_sidecar),
+                    (target_final_video_dir, new_final_video_dir)]
+    if replace_source:
+        replacements.extend([(_continue_source_working_path(target_data), new_source),
+                             (_continue_source_preview_video_path(target_data), None)])
     backups = []
+    installed = []
     token = uuid.uuid4().hex[:10]
-
     try:
-        # Exact-final sidecars are primary no-reencode cache data in v2.5.8.
-        # Move the whole directory aside transactionally so a failed project
-        # import can restore it just like the latent/audio files.
-        if target_final_video_dir.exists():
-            backup = target_final_video_dir.with_name(
-                target_final_video_dir.name + f".project_backup_{token}"
-            )
-            os.replace(target_final_video_dir, backup)
-            backups.append((target_final_video_dir, backup))
-        for target in targets:
+        for target, staged in replacements:
             if target.exists():
                 backup = target.with_name(target.name + f".project_backup_{token}")
                 os.replace(target, backup)
                 backups.append((target, backup))
-
-        if new_data is not None and new_manifest is not None:
-            os.replace(str(new_data), target_data)
-            os.replace(str(new_manifest), target_manifest)
-            if new_preview is not None and Path(new_preview).exists():
-                os.replace(str(new_preview), target_preview)
-            if new_audio is not None and Path(new_audio).exists():
-                os.replace(str(new_audio), target_audio)
-            if new_final_video_dir is not None and Path(new_final_video_dir).exists():
-                target_final_video_dir.mkdir(parents=True, exist_ok=True)
-                for source in Path(new_final_video_dir).iterdir():
-                    if source.is_file():
-                        os.replace(str(source), target_final_video_dir / source.name)
-            if new_relay_video is not None and Path(new_relay_video).exists():
-                os.replace(str(new_relay_video), target_relay_video)
-            if new_relay_sidecar is not None and Path(new_relay_sidecar).exists():
-                os.replace(str(new_relay_sidecar), target_relay_sidecar)
-        # No imported cache means an intentionally empty project. The old cache
-        # remains only in backups until this transaction succeeds.
+            if staged is not None and Path(staged).exists():
+                os.replace(staged, target)
+                installed.append(target)
     except Exception:
-        for target in targets:
-            try:
-                target.unlink(missing_ok=True)
-            except Exception:
-                pass
-        if target_final_video_dir.exists():
-            shutil.rmtree(target_final_video_dir, ignore_errors=True)
+        for target in reversed(installed):
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
         for target, backup in reversed(backups):
-            if backup.exists():
-                os.replace(backup, target)
+            os.replace(backup, target)
         raise
     else:
         for _, backup in backups:
@@ -4380,6 +4369,13 @@ def _replace_cache_transaction(
 
 
 def _import_project_archive(owner_id, archive_path):
+    paths = [_chain_paths(_project_cache_owner_id(owner_id, mode, motion))[0]
+             for mode, motion in _continue_mode_cache_keys()]
+    with shots.cache_access(*paths):
+        return _load_project_archive(owner_id, archive_path)
+
+
+def _load_project_archive(owner_id, archive_path):
     archive_path = Path(archive_path)
     work_root = _project_temp_root() / f"import_{uuid.uuid4().hex}"
     work_root.mkdir(parents=True, exist_ok=True)
@@ -4441,6 +4437,7 @@ def _import_project_archive(owner_id, archive_path):
             project_payload["extender"]["motion_context"] = bool(motion_context)
             project_payload["extender"].setdefault("settings", {})["generation_mode"] = generation_mode
             project_payload["extender"]["settings"]["motion_context"] = bool(motion_context)
+            original_clip_state = _project_clips_json(project_payload)
             clips = _clips_from_project_payload(project_payload)
             project_prompt_pack_signature = _prompt_pack_signature_from_project_payload(project_payload)
 
@@ -4714,6 +4711,8 @@ def _import_project_archive(owner_id, archive_path):
                 imported_manifest = _load_manifest_from_paths(new_data, new_manifest)
                 if imported_manifest is None:
                     raise ValueError("MiniMax H3 Extender Project: cache manifest is empty.")
+                if imported_manifest.get("shot_preview_needs_rebuild"):
+                    new_preview.unlink(missing_ok=True)
 
                 if new_relay_video.exists() and new_relay_sidecar.exists():
                     from .relayvsr_final import _h3_cache_identity
@@ -4860,6 +4859,9 @@ def _import_project_archive(owner_id, archive_path):
                             continuity_restore.append((clip_id, png_path, json_path))
 
             cached_count = int(len(imported_manifest.get("segments", []))) if imported_manifest else 0
+            if not random_access:
+                shots.restore_legacy_cards(clips, original_clip_state, imported_manifest)
+                shots.check_validated(new_data, imported_manifest, clips)
             # A clip can only remain validated when its physical cached segment is present.
             if random_access:
                 cached_ids = {
@@ -4930,6 +4932,7 @@ def _import_project_archive(owner_id, archive_path):
                 ),
                 generation_mode=generation_mode,
                 motion_context=motion_context,
+                replace_source=True,
             )
 
             # Portable .ext projects are intentionally single-mode/context. The frontend
@@ -5063,13 +5066,18 @@ def _capture_full_batch_project(function):
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         inputs = bound.arguments
-        result = function(*args, **kwargs)
+        owner = str(inputs.get("unique_id") if inputs.get("unique_id") is not None else "h3_extender")
+        cache_owner = _project_cache_owner_id(owner, inputs.get("generation_mode"), inputs.get("motion_context"))
+        with shots.cache_access(_chain_paths(cache_owner)[0]):
+            result = function(*args, **kwargs)
+        submitted = json.loads(inputs.get("clips_json") or "{}")
+        state = result["ui"]["h3_extender_state"][0]
+        state["project_load_token"] = submitted.get("project_load_token", "") if isinstance(submitted, dict) else ""
         if str(inputs.get("run_mode")) != "full_batch":
             return result
         cache = result["result"][0]
         if not isinstance(cache, dict):
             return result
-        state = result["ui"]["h3_extender_state"][0]
         settings = {name: copy.deepcopy(inputs[name]) for name in PROJECT_SETTING_NAMES if name in inputs}
         settings["clips_json"] = state["clips_json"]
         if state.get("refs_json") is not None:
@@ -5077,7 +5085,6 @@ def _capture_full_batch_project(function):
         # The Auto width/height widgets mirror the generated canvas. The UI
         # serializes its separate Manual fallback with this exact queued job.
         try:
-            submitted = json.loads(inputs.get("clips_json") or "{}")
             manual = submitted.get("project_manual_resolution", {})
             manual_canvas = _validated_manual_canvas(manual)
             if manual_canvas is not None:
@@ -5085,7 +5092,6 @@ def _capture_full_batch_project(function):
         except (ValueError, TypeError, AttributeError):
             pass  # Legacy/API jobs retain their supplied width/height fallback.
         mode = str(state.get("generation_mode") or settings["generation_mode"])
-        owner = str(inputs.get("unique_id") if inputs.get("unique_id") is not None else "h3_extender")
         project = {
             "schema_version": 2,
             "extender": {
@@ -6200,6 +6206,9 @@ class MiniMaxH3Extender:
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
 
+        shots.restore_legacy_cards(clips, clips_json, manifest)
+        shots.check_validated(data_path, manifest, clips)
+
         # If cards were removed, trim the physical cache immediately.
         if len(manifest.get("segments", [])) > len(clips):
             manifest = _truncate_chain(
@@ -6235,6 +6244,8 @@ class MiniMaxH3Extender:
         )
         source_working_changed = source_changed or working_geometry_changed
 
+        if source_working_changed and any(cfg["validated"] for cfg in clips):
+            raise ValueError("Validated Ref2VA cache has a different Clip 0 source or resolution.")
         if source_working_changed:
             if segments:
                 manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
@@ -6364,6 +6375,8 @@ class MiniMaxH3Extender:
         )
         previous_cache_resolution = dict(cache_resolution) if requested_mismatch else None
 
+        if requested_mismatch and any(cfg["validated"] for cfg in clips):
+            raise ValueError("Validated Ref2VA cache has different resolution or refinement settings.")
         if requested_mismatch:
             # Resolution is the one unavoidable global invalidation: latent
             # geometry cannot be mixed inside one sequential disk chain.
@@ -6491,13 +6504,11 @@ class MiniMaxH3Extender:
                 else None
             )
 
-            if bool(cfg.get("validated", False)):
-                if not existing or current_desc is None:
-                    raise RuntimeError(
-                        f"MiniMax H3 Extender: Ref2VA clip {i + 1} is marked Validated "
-                        "but its disk cache is missing. Refusing to rerender a validated clip. "
-                        "Uncheck Validated explicitly if you want this clip rendered again."
-                    )
+            incoming_motion = cfg["incoming_motion_context"]
+            reuse_problem = shots.reuse_problem(data_path, current_manifest, i, cfg)
+            if cfg["validated"]:
+                if reuse_problem:
+                    raise RuntimeError(f"Validated Ref2VA clip {i + 1}: {reuse_problem}.")
                 _LOG.info(
                     "H3 validated hard-skip: Ref2VA clip %d exists on disk; sampler forbidden",
                     i + 1,
@@ -6520,6 +6531,7 @@ class MiniMaxH3Extender:
                 str(run_mode) == "full_batch"
                 and existing
                 and current_desc is not None
+                and not reuse_problem
                 and bool(current_desc.get("computed", False))
                 and not bool(current_desc.get("validated", False))
             ):
@@ -6752,9 +6764,9 @@ class MiniMaxH3Extender:
                 audio_native_offset=audio_native_offset,
             )
 
-            trim_frames = None
+            trim_frames = 0
             first_visible_offset = 0
-            if i > 0:
+            if incoming_motion and i > 0:
                 if previous_proxy is None:
                     raise RuntimeError(
                         "MiniMax H3 Extender: previous cached latent is unavailable."
@@ -6772,7 +6784,7 @@ class MiniMaxH3Extender:
                 )
                 if base_context_proxy is not previous_proxy:
                     del base_context_proxy
-            elif source_meta is not None:
+            elif incoming_motion and i == 0 and source_meta is not None:
                 _send_extender_progress(
                     owner, i, len(clips), "preparing", "Encoding Clip 0 head guide",
                 )
@@ -6836,7 +6848,7 @@ class MiniMaxH3Extender:
                     seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
                     refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
                     external_sigmas=external_sigmas, motion=motion,
-                    previous_refined_proxy=(previous_proxy if i > 0 else None),
+                    previous_refined_proxy=(previous_proxy if incoming_motion and i > 0 else None),
                     context_length=context_length, audio_context_length=audio_context_length,
                 )
                 del first_pass
@@ -6855,6 +6867,7 @@ class MiniMaxH3Extender:
                 computed=(str(run_mode) == "full_batch"),
                 generation_seed=cfg["seed"],
                 first_visible_offset=int(first_visible_offset),
+                incoming_motion_context=incoming_motion,
             )
             previous_handle = result[0]
             previous_proxy = result[1]
@@ -6925,19 +6938,6 @@ class MiniMaxH3Extender:
                 previous_handle["status"] = f"interrupted after clip {int(interrupted_after)}"
             else:
                 final_manifest = _finish_batch_checkpoint(manifest_path, final_manifest)
-
-        # Persist the causal clip-id order as metadata only. This does not alter
-        # Motion Context execution; it lets the frontend detect a timeline edit
-        # made while independent Ref2VA was active and avoid restoring an old
-        # positional validation onto a newly inserted card.
-        if final_manifest is not None:
-            causal_cached_count = len(final_manifest.get("segments", []))
-            wanted_lineage = [str(cfg.get("id") or f"clip_{idx + 1}") for idx, cfg in enumerate(clips[:causal_cached_count])]
-            if list(final_manifest.get("extender_clip_ids") or []) != wanted_lineage:
-                final_manifest = dict(final_manifest)
-                final_manifest["extender_clip_ids"] = wanted_lineage
-                final_manifest["updated_at"] = time.time()
-                _write_json_atomic(manifest_path, final_manifest)
 
         # Color grading is montage metadata only. Keep it attached to each cached
         # decoded segment without invalidating latents or validation state.

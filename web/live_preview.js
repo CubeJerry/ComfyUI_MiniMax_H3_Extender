@@ -498,6 +498,10 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
 
     if (state.restoreRequestRunning) return;
     state.restoreRequestRunning = true;
+    const request = Symbol();
+    state.restoreRequest = request;
+    const extender = findUpstreamExtenderNode(node)?.__h3Extender;
+    const epoch = extender?.cacheStateEpoch;
 
     try {
         const params = new URLSearchParams();
@@ -526,6 +530,7 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
         }
 
         const payload = await response.json();
+        if (state.restoreRequest !== request || epoch !== extender?.cacheStateEpoch) return;
         if (!payload?.found || !payload?.video?.filename) {
             // During workflow restore the upstream Extender can finish restoring
             // its FL/REF state a few frames after Final Decode. Retry briefly so
@@ -575,7 +580,7 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
     } catch (_) {
         // Startup preview is convenience only; never break workflow loading.
     } finally {
-        state.restoreRequestRunning = false;
+        if (state.restoreRequest === request) state.restoreRequestRunning = false;
     }
 }
 
@@ -975,6 +980,7 @@ function clearPreviewForNewProject(ownerId) {
         // The active Extender cache is known to be empty after New Project; do
         // not spend the normal workflow-restore retry window looking for it.
         state.restoreLoaded = true;
+        state.restoreRequest = null;
         state.restoreRequestRunning = false;
         state.restoreModeOverride = null;
         state.restoreMotionOverride = null;
@@ -1007,6 +1013,7 @@ function refreshImportedProjectPreview(ownerId, generationMode = null, motionCon
         const state = makePlayer(node);
         state.liveLoaded = false;
         state.restoreLoaded = false;
+        state.restoreRequest = null;
         state.restoreRequestRunning = false;
         state.restoreModeOverride = String(generationMode || "") === "fl2va"
             ? "fl2va"

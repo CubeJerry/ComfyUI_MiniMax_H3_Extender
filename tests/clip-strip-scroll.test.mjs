@@ -213,3 +213,106 @@ test("deferred layout work does not overwrite later user or Add Clip navigation"
     flushFrames();
     assert.equal(runtime.cards.scrollLeft, runtime.cards.scrollWidth - runtime.cards.clientWidth);
 });
+
+function childWith(root, predicate) {
+    if (predicate(root)) return root;
+    for (const child of root.children) {
+        const result = childWith(child, predicate);
+        if (result) return result;
+    }
+}
+
+function changeInput(runtime, index, predicate, checked) {
+    const input = childWith(runtime.cards.children[index], predicate);
+    assert.equal(input.type, "checkbox");
+    input.checked = checked;
+    return input.listeners.get("change")();
+}
+
+test("working on a later cut preserves two timelines and the serialized setting", async () => {
+    const {context, runtime, render} = makeFixture();
+    // Both nodes live in the same renderer/document.
+    vm.runInContext(`
+        second = {...runtime, cards:document.createElement("div"), refsRow:document.createElement("div"),
+            state:parseState(serializeState(runtime.state)), jsonWidget:{value:""}};
+        otherNode = { ...node, id:43 };
+        render(otherNode, second);
+    `, context);
+    runtime.cachedCount = 12;
+    context.second.cards.scrollTo({left:1900, behavior:"instant"});
+    runtime.cards.scrollTo({left:4400,top:23,behavior:"instant"});
+    vm.runInContext('persistLocalRefInvalidation = () => { throw new Error("future clip hit disk"); }', context);
+    await changeInput(runtime, 14, el => el.dataset.h3IncomingMotion, false);
+    assert.equal(runtime.state.clips[14].incoming_motion_context, false);
+    const workflow = JSON.parse(runtime.jsonWidget.value);
+    assert.equal(workflow.clips[14].incoming_motion_context, false);
+    assert.equal(workflow.mode_clips.ref2va[14].incoming_motion_context, false);
+    assert.equal(vm.runInContext('parseState(serializeProjectState(runtime.state)).clips[14].incoming_motion_context', context), false);
+    assert.equal(runtime.cards.scrollLeft, 4400);
+    assert.equal(runtime.cards.scrollTop, 23);
+    assert.equal(context.second.cards.scrollLeft, 1900);
+    runtime.cards.clientWidth = 800;
+    render();
+    assert.equal(runtime.cards.scrollLeft, 4400);
+});
+
+test("failed disk edits preserve motion, validation, and computed status", async () => {
+    const {context, runtime} = makeFixture();
+    runtime.cachedCount = 18;
+    runtime.validatedCount = 16;
+    runtime.state.clips.forEach((c,i) => { c.validated = i < 16; });
+    runtime.computedIndices = new Set([16,17]);
+    vm.runInContext("persistLocalRefInvalidation = async () => false",context);
+    runtime.cards.scrollTo({left:4400,behavior:"instant"});
+    await changeInput(runtime, 14, el => el.dataset.h3IncomingMotion, false);
+    assert.equal(runtime.state.clips[14].incoming_motion_context, true);
+    const validation = el => el.type === "checkbox" && !el.dataset.h3IncomingMotion;
+    await changeInput(runtime, 14, validation, false);
+    assert.equal(runtime.validatedCount, 16);
+    assert.equal(runtime.state.clips[15].validated,true);
+    assert.deepEqual([...runtime.computedIndices], [16,17]);
+    vm.runInContext("persistLocalRefInvalidation = async () => true",context);
+    await changeInput(runtime, 14, el => el.dataset.h3IncomingMotion, false);
+    assert.equal(runtime.validatedCount, 14);
+    assert.equal(runtime.state.clips[13].validated, true);
+    assert.equal(runtime.state.clips[15].validated, false);
+    assert.equal(runtime.computedIndices.size, 0);
+    assert.equal(runtime.cards.scrollLeft,4400);
+});
+
+test("a mode change ignores an in-flight cache response and keeps later-card scroll", async () => {
+    const {context,runtime} = makeFixture();
+    context.URLSearchParams = URLSearchParams;
+    runtime.cards.scrollTo({left:4400,behavior:"instant"});
+    let done;
+    context.fetch = () => new Promise(resolve => { done = resolve; });
+    const restore = vm.runInContext("restoreCacheState(node,runtime)",context);
+    vm.runInContext('advanceCacheEpoch(runtime); runtime.state.motion_context = false; render(node,runtime);',context);
+    done({ok:true,json:async () => ({found:true,cached_count:18,validated_count:18})});
+    await restore;
+    assert.equal(runtime.validatedCount,0);
+    assert.equal(runtime.cards.scrollLeft,4400);
+});
+
+test("local refs and a current cache refresh keep the later card visible", async () => {
+    const {context,runtime,render} = makeFixture();
+    context.URLSearchParams = URLSearchParams;
+    runtime.cards.scrollTo({left:4400,behavior:"instant"});
+    assert.equal(await vm.runInContext("prepareLocalRefMutation(node,runtime,14)",context),true);
+    runtime.state.clips[14].local_refs.images = [{slot:2,ref:{id:"a".repeat(64), width:64, height:64}}];
+    render();
+    context.fetch = async () => ({ok:true,json:async () => ({found:true,cached_count:2,validated_count:1,
+        cached_clip_ids:runtime.state.clips.slice(0,2).map(c=>c.id)})});
+    await vm.runInContext("restoreCacheState(node,runtime)",context);
+    assert.equal(runtime.cards.scrollLeft,4400);
+    assert.equal(runtime.validatedCount,1);
+});
+
+test("incoming motion takes JSON booleans and defaults malformed values to ON", () => {
+    const {context} = makeFixture();
+    const values = vm.runInContext(`normalizeClipList([
+        {},{incoming_motion_context:false},{incoming_motion_context:true},
+        {incoming_motion_context:null},{incoming_motion_context:0},{incoming_motion_context:"false"}
+    ]).map(c => c.incoming_motion_context)`,context);
+    assert.deepEqual([...values],[true,false,true,true,true,true]);
+});

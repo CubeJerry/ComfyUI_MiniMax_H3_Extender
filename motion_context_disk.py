@@ -18,6 +18,7 @@ unchanged. This module only changes persistence/execution and final streaming.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import math
@@ -48,6 +49,7 @@ try:
 except Exception:  # static tests outside ComfyUI
     folder_paths = None
 
+from . import ref2va_cache as shots
 from .motion_context_ram import (
     FPS,
     _audio_exact_frames,
@@ -61,7 +63,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v3.1.1-RelayVSR"
+BUILD = "motion-context-disk-v3.2.0-shot-resets"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -170,19 +172,6 @@ def _extender_cache_owner_id(owner_id, generation_mode="ref2va", motion_context=
     return f"extender_{_safe_name(owner_id)}"
 
 
-def _copy_path_to_temp(source, suffix=""):
-    source = Path(source)
-    if not source.exists():
-        return None
-    token = uuid.uuid4().hex[:10]
-    temp = source.with_name(source.name + f".bootstrap_{token}{suffix}")
-    if source.is_dir():
-        shutil.copytree(source, temp)
-    else:
-        shutil.copy2(source, temp)
-    return temp
-
-
 def _prefix_validated_ids(clip_entries):
     out = []
     for item in clip_entries:
@@ -196,108 +185,203 @@ def _prefix_validated_ids(clip_entries):
 
 
 def _bootstrap_ref2va_manifest(manifest, runtime_mode, clip_entries):
-    manifest = dict(manifest or {})
-    source_sequence_mode = str(manifest.get("sequence_mode") or "ref2va").lower().strip()
-    source_checkpoint_interrupted = bool(manifest.get("batch_interrupted", False))
-    source_checkpoint_snapshot_count = int(manifest.get("batch_snapshot_count", 0) or 0)
-    source_checkpoint_total_clips = int(manifest.get("batch_total_clips", 0) or 0)
-    source_segments = [dict(x) for x in manifest.get("segments", [])]
-    clip_entries = [
-        {"id": str(x.get("id") or "").strip(), "validated": bool(x.get("validated", False))}
-        for x in (clip_entries or [])
-        if str(x.get("id") or "").strip()
-    ]
-    clip_order = [x["id"] for x in clip_entries]
-    validated_lookup = {x["id"]: bool(x.get("validated", False)) for x in clip_entries}
-    prefix_ids = set(_prefix_validated_ids(clip_entries))
-
-    if runtime_mode == "ref2va_independent":
-        source_ids = [str(x) for x in list(manifest.get("extender_clip_ids") or [])]
-        rebuilt = []
-        for idx, seg in enumerate(source_segments):
-            desc = dict(seg)
-            clip_id = str(desc.get("clip_id") or "").strip()
-            if not clip_id and idx < len(source_ids):
-                clip_id = str(source_ids[idx] or "").strip()
-            if not clip_id and idx < len(clip_order):
-                clip_id = clip_order[idx]
-            if not clip_id:
-                continue
-            desc["clip_id"] = clip_id
-            desc["validated"] = bool(validated_lookup.get(clip_id, desc.get("validated", False)))
-
-            # Motion ON stores the full causal latent geometry in ``frames`` and
-            # removes ``trim_frames`` only when producing the visible corrected
-            # video/audio segment.  Motion OFF is random-access and has no causal
-            # trim, so preserve both geometries explicitly when crossing ON->OFF:
-            # ``source_frames`` remains the VideoVAE/audio-latent decode size,
-            # while ``frames`` becomes the actual visible timeline duration.
-            # ``visible_offset`` lets a later cache repair crop a full source
-            # decode instead of silently reintroducing the overlap frames.
-            if source_sequence_mode != "ref2va_independent":
-                source_frames = int(desc.get("frames", 0) or 0)
-                source_trim = int(desc.get("trim_frames", 0) or 0)
-                visible_frames = int(source_frames - source_trim)
-                if source_frames <= 0 or source_trim < 0 or visible_frames <= 0:
-                    raise ValueError(
-                        "MiniMax H3 Extender: invalid causal frame geometry while "
-                        f"bootstrapping Motion OFF (frames={source_frames}, trim={source_trim})."
-                    )
-                desc["source_frames"] = int(source_frames)
-                desc["source_trim_frames"] = int(source_trim)
-                desc["visible_offset"] = int(source_trim)
-                desc["frames"] = int(visible_frames)
-                desc["trim_frames"] = 0
-            rebuilt.append(desc)
-        manifest["segments"] = rebuilt
-        manifest["sequence_mode"] = "ref2va_independent"
-        manifest["extender_clip_ids"] = [str(x.get("clip_id") or "") for x in rebuilt if str(x.get("clip_id") or "")]
-    else:
-        by_clip_id = {}
-        source_ids = [str(x) for x in list(manifest.get("extender_clip_ids") or [])]
-        for idx, seg in enumerate(source_segments):
-            desc = dict(seg)
-            clip_id = str(desc.get("clip_id") or "").strip()
-            if not clip_id and idx < len(source_ids):
-                clip_id = str(source_ids[idx] or "").strip()
-            if clip_id:
-                desc["clip_id"] = clip_id
-                by_clip_id[clip_id] = desc
-        rebuilt = []
-        for clip_id in clip_order:
-            desc = by_clip_id.get(clip_id)
-            if desc is None:
-                break
-            item = dict(desc)
-            item["clip_id"] = clip_id
-            item["validated"] = clip_id in prefix_ids
-            rebuilt.append(item)
-        manifest["segments"] = rebuilt
-        manifest["sequence_mode"] = "ref2va"
-        manifest["extender_clip_ids"] = [str(x.get("clip_id") or "") for x in rebuilt]
-
-    # Recompute from the target-mode descriptor semantics.  In particular, an
-    # ON->OFF bridge must count only the already-visible continuation frames,
-    # not the overlap still present in each source latent.
-    manifest["final_frame_count"] = _final_frame_count(manifest.get("segments", []))
+    manifest = dict(manifest)
+    independent = runtime_mode == "ref2va_independent"
+    entries = list(clip_entries)
+    ids = [entry["id"] for entry in entries]
+    source = manifest["segments"]
+    by_id = {shots.clip_identity(manifest, i): dict(desc) for i, desc in enumerate(source)}
+    if len(set(ids)) != len(ids) or len(by_id) != len(source) or None in by_id:
+        raise ValueError("Cannot switch Ref2VA mode with duplicate or missing clip IDs.")
+    prefix = ids[:len(source)]
+    if set(prefix) != set(by_id) or (independent and prefix != list(by_id)):
+        raise ValueError("Cached clips do not match the contiguous timeline. Both caches were kept.")
+    validated_ids = set(_prefix_validated_ids(entries))
+    rebuilt = []
+    for i, cid in enumerate(prefix):
+        desc = by_id[cid]
+        desc.update(index=i, clip_id=cid)
+        if independent:
+            incoming = shots.recorded_motion(desc, i)
+            desc[shots.MOTION] = incoming
+            trim = desc["trim_frames"]
+            desc["source_trim_frames"] = trim
+            if trim:
+                desc["source_frames"] = desc["frames"]
+                desc["visible_offset"] = trim
+                desc["frames"] -= trim
+            desc["trim_frames"] = 0
+            desc["validated"] = bool(entries[i].get("validated"))
+        else:
+            shots.restore_causal_geometry(desc, i)
+            desc["validated"] = cid in validated_ids
+        rebuilt.append(desc)
+    manifest["segments"] = rebuilt
+    manifest["sequence_mode"] = runtime_mode
+    manifest["extender_clip_ids"] = prefix
+    manifest["final_frame_count"] = _final_frame_count(rebuilt)
     manifest["updated_at"] = time.time()
-    manifest["batch_in_progress"] = False
-    if source_checkpoint_interrupted:
-        # A Motion ON/OFF toggle is not a new generation run. Preserve an
-        # explicit user Interrupt checkpoint so COMPUTED keeps its exact
-        # checkpoint semantics after crossing the Ref2VA motion toggle.
+    manifest["shot_preview_needs_rebuild"] = True
+    if manifest.pop("batch_in_progress", False):
         manifest["batch_interrupted"] = True
-        manifest["batch_snapshot_count"] = int(source_checkpoint_snapshot_count)
-        if source_checkpoint_total_clips > 0:
-            manifest["batch_total_clips"] = int(source_checkpoint_total_clips)
-    else:
-        manifest["batch_interrupted"] = False
-        manifest.pop("batch_snapshot_count", None)
-        manifest.pop("batch_total_clips", None)
+    # The destination assembles its preview from the selected segments.
+    for key in ("preview_committed_count", "preview_audio_mode", "preview_portable_full",
+                "preview_fl2va_timeline_signature"):
+        manifest.pop(key, None)
     return manifest
 
 
-def _bootstrap_ref2va_motion_on_to_independent_video_dir(source_data, normalized_manifest):
+def _stage_causal_chain(source_data, data, sidecars, manifest, staged_audio):
+    """Pack random-access slots in timeline order before causal suffix truncation."""
+    from .extender import _hash_file
+    from .fl2va_engine import _copy_cache_spec
+    source_dir = source_data.with_suffix(".fl2va.video")
+    with open(source_data, "rb") as src, open(data, "wb") as dst:
+        if src.read(_DATA_START) != _DATA_MAGIC:
+            raise ValueError("Invalid Ref2VA cache header.")
+        dst.write(_DATA_MAGIC)
+        for i, desc in enumerate(manifest["segments"]):
+            cid = _safe_name(desc["clip_id"])
+            for stream in ("video", "audio"):
+                desc[stream] = _copy_cache_spec(src, dst, desc[stream])
+            desc["latent_end"] = dst.tell()
+            desc.pop("decoded_mp4_blob", None)
+            preview = source_dir / f"{cid}.mp4"
+            paired = bool(desc["trim_frames"])
+            proof = desc.pop("causal_derivatives", {})
+            if preview.is_file() and (not paired or _hash_file(preview) == proof.get("preview")):
+                desc["decoded_mp4_blob"] = _write_blob_raw(dst, preview)
+            desc["segment_end"] = dst.tell()
+            for ext in ("mp4", "mkv", "mov", "webm"):
+                exact = source_dir / f"{cid}.final.{ext}"
+                if exact.is_file() and (not paired or _hash_file(exact) == proof.get("final")):
+                    shutil.copy2(exact, sidecars / f"ref2va_{i:04d}.{ext}")
+            if paired and not proof.get("audio"):
+                desc.pop("decoded_audio", None)
+            # Clip-by-Clip replaces the tail MP4 at latent_end. Move embedded
+            # legacy PCM into the audio cache so that rewrite cannot erase it.
+            meta = desc.get("decoded_audio")
+            if meta and meta.get("storage") != "audio_cache":
+                _ensure_audio_cache_file(staged_audio)
+                with staged_audio.open("ab") as pcm:
+                    meta["waveform"] = _copy_cache_spec(src, pcm, meta["waveform"])
+                meta["storage"] = "audio_cache"
+        dst.flush()
+        os.fsync(dst.fileno())
+
+
+def _read_handoff_manifest(data, path, expected_mode):
+    # Recovery normally commits a shortened prefix. A mode switch must leave
+    # both original histories available if either one is incomplete.
+    if not path.exists():
+        return None
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("version") != CACHE_VERSION or manifest.get("sequence_mode", "ref2va") != expected_mode:
+        raise ValueError("Cannot switch mode with an incompatible Ref2VA cache.")
+    size = data.stat().st_size
+    with data.open("rb") as stream:
+        if stream.read(_DATA_START) != _DATA_MAGIC:
+            raise ValueError("Invalid Ref2VA cache header.")
+    for desc in manifest["segments"]:
+        if not _DATA_START <= _segment_start(desc) < _latent_payload_end(desc) <= _segment_end(desc) <= size:
+            raise ValueError("Incomplete Ref2VA clip. Both cache owners were kept.")
+    shots.migrate_decoded_shots(manifest)
+    return manifest
+
+
+def _handoff_ref2va_cache(owner, source_motion, clip_entries):
+    target_motion = not source_motion
+    source_owner = _extender_cache_owner_id(owner, "ref2va", source_motion)
+    target_owner = _extender_cache_owner_id(owner, "ref2va", target_motion)
+    source_data, source_path = _chain_paths(source_owner)
+    target_data, target_path = _chain_paths(target_owner)
+    with shots.cache_access(source_data, target_data):
+        return _transfer_ref2va_cache(owner, source_motion, clip_entries, source_data, source_path,
+                                      target_owner, target_data, target_path)
+
+
+def _transfer_ref2va_cache(owner, source_motion, clip_entries, source_data, source_path,
+                           target_owner, target_data, target_path):
+    from .extender import _replace_cache_transaction
+    target_motion = not source_motion
+    for data, path in ((source_data, source_path), (target_data, target_path)):
+        if data.exists() != path.exists():
+            raise ValueError("Incomplete Ref2VA cache. Both cache owners were kept.")
+    source = _read_handoff_manifest(source_data, source_path, _extender_runtime_mode("ref2va", source_motion))
+    target = _read_handoff_manifest(target_data, target_path, _extender_runtime_mode("ref2va", target_motion))
+    if source is None:
+        if any(c.get("validated") for c in clip_entries):
+            raise ValueError("Validated clip cache is missing. Both modes were kept.")
+        if (target or {}).get("segments"):
+            raise ValueError("Active Ref2VA cache is missing. The other cache was kept.")
+        return {"ok": True, "bootstrapped": False, "found": False}
+
+    if source_motion:
+        shots.check_validated(source_data, source, clip_entries)
+    history = shots.branch_state(source_data, source)
+    target_history = shots.branch_state(target_data, target) if target else None
+    shots.check_handoff(history, target_history, source.get("handoff_from_generations"))
+    for i, desc in enumerate(source["segments"]):
+        desc["generation_id"] = history[1][i][1]
+        if source_motion and shots.recorded_motion(desc, i):
+            expected = shots.parent_identity(source_data, source, i)
+            if desc.get("parent_generation_id", expected) != expected:
+                raise ValueError(f"Clip {i + 1} has a different cached predecessor.")
+            desc["parent_generation_id"] = expected
+    mode = "ref2va" if target_motion else "ref2va_independent"
+    normalized = _bootstrap_ref2va_manifest(source, mode, clip_entries)
+    normalized.update(owner_id=target_owner, build=BUILD, handoff_from_generations=history)
+    incoming_updates = {}
+    new_takes = {shots.clip_identity(source, i) for i, desc in enumerate(source["segments"])
+                 if "source_trim_frames" not in desc}
+    if target_motion:
+        for i, desc in enumerate(normalized["segments"]):
+            # A new independent take defines a cut. For inherited causal takes,
+            # preserve any pending card edit and check it before validation.
+            if desc["clip_id"] in new_takes:
+                incoming_updates[desc["clip_id"]] = desc[shots.MOTION]
+            if i and desc["trim_frames"] and "parent_generation_id" not in desc:
+                # Old independent caches did not record the original causal
+                # parent. An identical pair in the causal branch proves it.
+                if not target_history or target_history[1][i-1:i+1] != history[1][i-1:i+1]:
+                    raise ValueError(f"Cannot prove the original predecessor of clip {i + 1}. Both caches were kept.")
+                desc["parent_generation_id"] = history[1][i-1][1]
+            card = dict(clip_entries[i])
+            if desc["clip_id"] in incoming_updates:
+                card[shots.MOTION] = desc[shots.MOTION]
+            problem = shots.reuse_problem(source_data, normalized, i, card)
+            if problem and (desc["validated"] or desc.get("computed")):
+                raise ValueError(f"Cannot transfer clip {i + 1}: {problem}. Both caches were kept.")
+
+    with tempfile.TemporaryDirectory(dir=source_data.parent, prefix=".ref2va-") as temp:
+        stage = Path(temp)
+        data, meta, sidecars = stage / "chain.h3cache", stage / "chain.json", stage / "video"
+        sidecars.mkdir()
+        audio = _decoded_audio_cache_path(source_data)
+        staged_audio = stage / "audio"
+        if audio.exists():
+            shutil.copy2(audio, staged_audio)
+        if target_motion:
+            _stage_causal_chain(source_data, data, sidecars, normalized, staged_audio)
+            shots.migrate_decoded_shots(normalized)
+        else:
+            shutil.copy2(source_data, data)
+            _bootstrap_ref2va_motion_on_to_independent_video_dir(source_data, normalized, sidecars)
+        working = _source_working_path(source_data)
+        staged_source = shutil.copy2(working, stage / "source.mkv") if working.exists() else None
+        _write_json_atomic(meta, normalized)
+        _replace_cache_transaction(
+            owner, data, meta, new_audio=staged_audio, new_final_video_dir=sidecars,
+            generation_mode="ref2va", motion_context=target_motion,
+            replace_source=True, new_source=staged_source,
+        )
+    return {"ok": True, "bootstrapped": True, "found": True,
+            "incoming_updates": incoming_updates,
+            "cached_count": len(normalized["segments"]),
+            "validated_ids": [s["clip_id"] for s in normalized["segments"] if s["validated"]]}
+
+
+def _bootstrap_ref2va_motion_on_to_independent_video_dir(source_data, normalized_manifest, staged_dir):
     """Build Motion-OFF random-access sidecars from Motion-ON caches without VAE.
 
     Causal Ref2VA stores the neutral H.264 per-clip preview inside the .h3cache
@@ -306,24 +390,26 @@ def _bootstrap_ref2va_motion_on_to_independent_video_dir(source_data, normalized
     in ``.fl2va.video`` under stable clip-id names. Materialize/remap those
     existing encoded bytes only; never decode or re-encode them here.
     """
+    from .extender import _hash_file
     source_data = Path(source_data)
-    token = uuid.uuid4().hex[:10]
-    staged_dir = source_data.with_name(source_data.name + f".bootstrap_random_video_{token}.tmp")
-    staged_dir.mkdir(parents=True, exist_ok=False)
     source_final_dir = source_data.with_suffix(".final.video")
-    copied_any = False
     try:
         for idx, desc in enumerate(normalized_manifest.get("segments", [])):
             clip_id = str(desc.get("clip_id") or "").strip()
             if not clip_id:
                 continue
             safe_id = _safe_name(clip_id)
+            proof = {}
+            if desc.get("source_trim_frames"):
+                desc["causal_derivatives"] = proof
+                proof["audio"] = bool(desc.get("decoded_audio"))
 
             blob = desc.get("decoded_mp4_blob")
             if isinstance(blob, dict) and "offset" in blob and "nbytes" in blob:
                 preview_target = staged_dir / f"{safe_id}.mp4"
                 _copy_blob_to_file(source_data, blob, preview_target)
-                copied_any = True
+                if desc.get("source_trim_frames"):
+                    proof["preview"] = _hash_file(preview_target)
 
             # Preserve the exact-final bitstream produced during the causal
             # Full Batch, simply renaming it to the random-access clip-id form.
@@ -334,7 +420,8 @@ def _bootstrap_ref2va_motion_on_to_independent_video_dir(source_data, normalized
                         continue
                     final_target = staged_dir / f"{safe_id}.final{source_final.suffix}"
                     shutil.copy2(source_final, final_target)
-                    copied_any = True
+                    if desc.get("source_trim_frames"):
+                        proof["final"] = _hash_file(final_target)
                     # Independent Ref2VA has no handoff frame trimming. The
                     # causal final cache covers this clip's full visible frame
                     # count, so make its existing cache metadata compatible with
@@ -342,7 +429,6 @@ def _bootstrap_ref2va_motion_on_to_independent_video_dir(source_data, normalized
                     desc["final_video_visible_frames"] = int(desc.get("frames", 0) or 0)
                     break
 
-        return staged_dir if copied_any else None
     except Exception:
         shutil.rmtree(staged_dir, ignore_errors=True)
         raise
@@ -691,7 +777,10 @@ def _load_manifest_from_paths(data_path, manifest_path):
             f"H3 Disk Cache version {manifest.get('version')} is incompatible; "
             f"expected {CACHE_VERSION}."
         )
-    return _recover_manifest(data_path, manifest_path, manifest)
+    manifest = _recover_manifest(data_path, manifest_path, manifest)
+    if shots.migrate_decoded_shots(manifest):
+        _write_json_atomic(manifest_path, manifest)
+    return manifest
 
 
 def _load_manifest(cache):
@@ -876,6 +965,8 @@ def _truncate_chain(data_path, manifest_path, manifest, index):
 
     reduced = dict(manifest)
     reduced["segments"] = prefix
+    if "extender_clip_ids" in reduced:
+        reduced["extender_clip_ids"] = reduced["extender_clip_ids"][:index]
     if index == 0:
         reduced["geometry"] = None
     reduced["final_frame_count"] = _final_frame_count(prefix)
@@ -1117,6 +1208,7 @@ class MiniMaxH3MotionContextDiskJoin:
         generation_seed=None,
         generation_clip_id=None,
         first_visible_offset=0,
+        incoming_motion_context=None,
     ):
         data_path, manifest_path, manifest, mode, stop, index = _effective_state(
             previous_cache, run_mode, fps, unique_id
@@ -1209,6 +1301,13 @@ class MiniMaxH3MotionContextDiskJoin:
                 desc["visible_offset"] = int(visible_offset)
                 desc["frames"] = int(source_frames - visible_offset)
                 desc["continued_from_source"] = True
+            if incoming_motion_context is not None:
+                desc[shots.MOTION] = incoming_motion_context
+                desc["generation_id"] = uuid.uuid4().hex
+                desc["parent_generation_id"] = (
+                    shots.parent_identity(data_path, manifest, index) if incoming_motion_context else None
+                )
+                desc["shot_decode_version"] = shots.SHOT_DECODE_VERSION
             if generation_seed is not None:
                 desc["generation_seed"] = int(generation_seed)
             if generation_clip_id is not None:
@@ -1219,6 +1318,8 @@ class MiniMaxH3MotionContextDiskJoin:
             manifest = dict(manifest)
             manifest["geometry"] = geom if manifest.get("geometry") is None else manifest["geometry"]
             manifest["segments"] = segments
+            if generation_clip_id is not None:
+                manifest["extender_clip_ids"] = [shots.clip_identity(manifest, i) for i in range(len(segments))]
             manifest["final_frame_count"] = _final_frame_count(segments)
             manifest["build"] = BUILD
             manifest["updated_at"] = time.time()
@@ -3151,6 +3252,10 @@ def _upgrade_cached_audio_gain_chain(
         meta = segments[i].get("decoded_audio")
         if not isinstance(meta, dict) or "timeline_gain" in meta:
             continue
+        if not shots.recorded_motion(segments[i], i):
+            segments[i]["decoded_audio"] = {**meta, "timeline_gain": 1.0}
+            changed = True
+            continue
         previous_cached = _load_cached_decoded_audio(data_path, segments[i - 1])
         if previous_cached is None:
             continue
@@ -3195,6 +3300,7 @@ def _write_preview_pcm_audio(
     individual_raw_audio_paths=None,
     individual_errors=None,
     source_meta=None,
+    causal=True,
 ):
     """Write exact timeline PCM for a progressive preview.
 
@@ -3255,7 +3361,7 @@ def _write_preview_pcm_audio(
                     "H3 progressive preview: decoded audio cache is missing."
                 )
 
-            if previous_tail is not None:
+            if previous_tail is not None and (not causal or shots.recorded_motion(desc, i)):
                 wave = _smooth_segment_entry_level(previous_tail, wave, sample_rate)
                 wave = _declick_segment(previous_tail, wave, sample_rate, 12.0)
 
@@ -3362,6 +3468,7 @@ def _assemble_progressive_preview(
     output_path,
     token,
     source_meta=None,
+    causal=True,
 ):
     """Assemble a full preview with video stream-copy + one AAC encode."""
     root = _ensure_cache_root()
@@ -3382,6 +3489,7 @@ def _assemble_progressive_preview(
             raw_audio,
             token,
             source_meta=source_meta,
+            causal=causal,
         )
         if Path(output_path).exists():
             Path(output_path).unlink()
@@ -3415,7 +3523,8 @@ def _render_one_final_video_segment(
     i = int(index)
     curr = segments[i]
 
-    if i == 0:
+    incoming = shots.recorded_motion(curr, i)
+    if i == 0 or not incoming:
         v = _load_segment_video(data_path, curr)
         video = vae.decode(v)
         if progress is not None:
@@ -3429,12 +3538,12 @@ def _render_one_final_video_segment(
         visible_offset = int(curr.get("visible_offset", 0) or 0)
         if int(video.shape[0]) != source_frames:
             raise RuntimeError(
-                f"H3 progressive preview: clip 1 decoded {video.shape[0]}, "
+                f"H3 progressive preview: clip {i + 1} decoded {video.shape[0]}, "
                 f"expected source frames {source_frames}."
             )
         if visible_offset < 0 or visible_offset + visible_frames > source_frames:
             raise RuntimeError(
-                "H3 progressive preview: Clip 1 visible window lies outside its source latent."
+                f"H3 progressive preview: clip {i + 1} visible window lies outside its source latent."
             )
         if visible_offset or visible_frames != source_frames:
             video = video[visible_offset:visible_offset + visible_frames]
@@ -3469,7 +3578,8 @@ def _render_one_final_audio_segment(
     i = int(index)
     curr = segments[i]
 
-    if i == 0:
+    incoming = shots.recorded_motion(curr, i)
+    if i == 0 or not incoming:
         audio = _decode_single_audio(data_path, curr, audio_vae, fps)
         if progress is not None:
             progress.advance()
@@ -3771,6 +3881,7 @@ def _export_video_editor_batch_from_cached_segments(
             individual_raw_audio_paths=individual_audio_paths,
             individual_errors=errors,
             source_meta=source_meta,
+            causal=(manifest or {}).get("sequence_mode", "ref2va") == "ref2va",
         )
         if errors:
             raise RuntimeError("H3 Video Editor audio capture failed: " + "; ".join(errors))
@@ -3897,6 +4008,7 @@ def _export_final_from_exact_segment_caches(
             ),
             individual_errors=individual_audio_errors,
             source_meta=source_meta,
+            causal=(manifest or {}).get("sequence_mode", "ref2va") == "ref2va",
         )
         _mux_final(
             ffmpeg,
@@ -4326,7 +4438,7 @@ def cache_full_batch_ref2va_segment(
             rendered_video = None
 
         can_cache_audio = bool(audio_vae is not None)
-        if can_cache_audio and idx > 0:
+        if can_cache_audio and idx > 0 and shots.recorded_motion(desc, idx):
             previous_audio = _load_cached_decoded_audio(data_path, segments[idx - 1])
             can_cache_audio = previous_audio is not None
             if previous_audio is not None:
@@ -4421,7 +4533,7 @@ def _ensure_ref2va_audio_cache(
                 del cached
                 continue
 
-            if i == 0:
+            if not shots.recorded_motion(desc, i) or i == 0:
                 seam_shift = 0
             elif "decoded_seam_shift" in desc:
                 seam_shift = int(desc.get("decoded_seam_shift", 0) or 0)
@@ -4661,6 +4773,10 @@ def _export_live_candidate_preview(
     )
     segments = [dict(x) for x in manifest.get("segments", [])]
 
+    if validated_count:
+        manifest, _ = _ensure_ref2va_audio_cache(
+            data_path, manifest_path, manifest, vae, audio_vae, fps, count=validated_count
+        )
     # Commit already validated clips into ONE persistent full preview cache.
     manifest, committed_path, committed_video_path = _sync_committed_preview(
         data_path,
@@ -4814,8 +4930,8 @@ def _export_live_candidate_preview(
             candidate_index + 1,
             int(seam_shift),
             (
-                "clip 1"
-                if candidate_index == 0
+                f"clip {candidate_index + 1}"
+                if candidate_index == 0 or not shots.recorded_motion(segments[candidate_index], candidate_index)
                 else f"pair {candidate_index}->{candidate_index + 1}"
             ),
         )
@@ -4824,7 +4940,7 @@ def _export_live_candidate_preview(
             preview_path,
             total_frames,
             int(seam_shift),
-            None if candidate_index == 0 else int(candidate_index),
+            int(candidate_index) if candidate_index and shots.recorded_motion(segments[candidate_index], candidate_index) else None,
             "full_cached_prefix_plus_candidate",
         )
 
@@ -4966,6 +5082,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
             temp_preview,
             token,
             source_meta=source_meta,
+            causal=cached_mode == "ref2va",
         )
 
         preview_path = _reserve_preview_temp_path(final_id)
@@ -5028,82 +5145,10 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             if bool(source_motion) == bool(target_motion):
                 return web.json_response({"ok": True, "bootstrapped": False, "found": False, "reason": "same_mode"})
 
-            source_owner = _extender_cache_owner_id(owner_id, "ref2va", source_motion)
-            target_owner = _extender_cache_owner_id(owner_id, "ref2va", target_motion)
-            source_data, source_manifest_path = _chain_paths(source_owner)
-            target_data, target_manifest_path = _chain_paths(target_owner)
-
-            # ON -> OFF is a one-way handoff of the CURRENT causal timeline.
-            # Any older independent cache belongs to a previous OFF branch and
-            # must not be resurrected.  Let _replace_cache_transaction() replace
-            # it transactionally after the source cache has been validated.
-            replace_existing_target = bool(source_motion) and not bool(target_motion)
-            if (
-                target_data.exists()
-                and target_manifest_path.exists()
-                and not replace_existing_target
-            ):
-                return web.json_response({"ok": True, "bootstrapped": False, "found": True, "reason": "target_exists"})
-            if not source_data.exists() or not source_manifest_path.exists():
-                return web.json_response({"ok": True, "bootstrapped": False, "found": False, "reason": "source_missing"})
-
-            source_manifest = _load_manifest_from_paths(source_data, source_manifest_path)
-            if source_manifest is None:
-                return web.json_response({"ok": True, "bootstrapped": False, "found": False, "reason": "source_invalid"})
-
-            normalized_manifest = _bootstrap_ref2va_manifest(
-                source_manifest,
-                "ref2va" if target_motion else "ref2va_independent",
-                clip_entries,
-            )
-
-            token = uuid.uuid4().hex[:10]
-            staged_manifest = source_manifest_path.with_name(source_manifest_path.name + f".bootstrap_manifest_{token}.tmp")
-            _write_json_atomic(staged_manifest, normalized_manifest)
-            staged_data = _copy_path_to_temp(source_data, suffix=".tmp")
-            staged_preview = _copy_path_to_temp(_decoded_preview_cache_path(source_data), suffix=".tmp")
-            staged_audio = _copy_path_to_temp(_decoded_audio_cache_path(source_data), suffix=".tmp")
-            staged_final_dir = None
-            if source_motion and not target_motion:
-                # Motion ON -> OFF needs a layout conversion, not a raw folder
-                # copy: causal caches are positional/embedded while independent
-                # Ref2VA looks them up by stable clip ID.
-                staged_final_dir = _bootstrap_ref2va_motion_on_to_independent_video_dir(
-                    source_data, normalized_manifest
-                )
-                # The helper may add random-access-only final cache metadata.
-                _write_json_atomic(staged_manifest, normalized_manifest)
-            else:
-                for candidate in (source_data.with_suffix(".final.video"), source_data.with_suffix(".fl2va.video")):
-                    if candidate.exists():
-                        staged_final_dir = _copy_path_to_temp(candidate, suffix=".tmp")
-                        break
-
-            from .extender import _replace_cache_transaction
-            _replace_cache_transaction(
-                owner_id,
-                staged_data,
-                staged_manifest,
-                staged_preview,
-                staged_audio,
-                staged_final_dir,
-                generation_mode="ref2va",
-                motion_context=target_motion,
-            )
-            if staged_final_dir is not None:
-                shutil.rmtree(staged_final_dir, ignore_errors=True)
-            validated_count = (
-                _validated_prefix_count(normalized_manifest.get("segments", []))
-                if target_motion
-                else sum(bool(x.get("validated", False)) for x in normalized_manifest.get("segments", []))
-            )
-            return web.json_response({
-                "ok": True,
-                "bootstrapped": True,
-                "found": True,
-                "cached_count": int(len(normalized_manifest.get("segments", []))),
-                "validated_count": int(validated_count),
-            })
+            result = _handoff_ref2va_cache(owner_id, source_motion, clip_entries)
+            return web.json_response(result)
+        except (ValueError, RuntimeError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=409)
         except Exception as exc:
             _LOG.exception("H3 Ref2VA motion-toggle cache bootstrap failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
@@ -5132,105 +5177,114 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
 
             cache_owner = _extender_cache_owner_id(owner_id, generation_mode, motion_context)
             data_path, manifest_path = _chain_paths(cache_owner)
-            manifest = _load_manifest_from_paths(data_path, manifest_path)
-            if manifest is None:
-                # No generated cache yet: clips_json is the only persistence
-                # source, so there is nothing on disk to invalidate.
-                return web.json_response({"ok": True, "found": False})
-
-            segments = [dict(x) for x in manifest.get("segments", [])]
-            if runtime_mode == "ref2va_independent":
-                target = None
-                if clip_id:
-                    target = next((x for x in segments if str(x.get("clip_id") or "") == clip_id), None)
-                elif 0 <= clip_index < len(segments):
-                    target = segments[clip_index]
-                if target is not None:
-                    target["validated"] = bool(requested_validated)
-            elif runtime_mode == "fl2va":
-                # FL2VA validation is random-access except for explicit Previous
-                # dependencies. Persist the exact manual checkbox state. When an
-                # upstream plan is invalidated, only the consecutive Previous
-                # followers reported by the current UI state are invalidated too;
-                # the first manual follower remains independent. Consuming
-                # COMPUTED here prevents an interrupted checkpoint from silently
-                # resurrecting after an explicit manual validation change.
-                target = None
-                if clip_id:
-                    target = next(
-                        (x for x in segments if str(x.get("clip_id") or "") == clip_id),
-                        None,
-                    )
-                elif 0 <= clip_index < len(segments):
-                    target = segments[clip_index]
-                if target is not None:
+            with shots.cache_access(data_path):
+                manifest = _load_manifest_from_paths(data_path, manifest_path)
+                if manifest is None:
+                    # No generated cache yet: clips_json is the only persistence
+                    # source, so there is nothing on disk to invalidate.
                     if requested_validated:
-                        target["validated"] = True
-                        target.pop("computed", None)
-                    else:
-                        invalidate_ids = {str(target.get("clip_id") or "")}
-                        invalidate_ids.update(
-                            str(x) for x in (body.get("dependent_clip_ids") or []) if str(x)
-                        )
-                        for desc in segments:
-                            if str(desc.get("clip_id") or "") in invalidate_ids:
-                                desc["validated"] = False
-                                desc.pop("computed", None)
-            else:
-                # Ref2VA Motion ON is causal: validation is a contiguous prefix.
-                # Manual unvalidation clears the selected clip and everything
-                # after it. Manual validation may only extend the existing
-                # validated prefix by the selected cached segment.
-                if clip_index < 0:
-                    return web.json_response({"ok": False, "error": "Invalid clip index."}, status=400)
-                if clip_index >= len(segments):
-                    # Recovery path for a stale workflow validation flag after the
-                    # physical cache was removed. There is nothing on disk to
-                    # invalidate, so allow manual unvalidation to clear the UI
-                    # state. Validation still requires a real cached segment.
-                    if not requested_validated:
-                        return web.json_response({"ok": True, "found": False})
-                    return web.json_response({"ok": False, "error": "Invalid clip index."}, status=400)
-                if requested_validated:
-                    if any(not bool(segments[i].get("validated", False)) for i in range(clip_index)):
-                        return web.json_response({
-                            "ok": False,
-                            "error": "Ref2VA Motion Context validation must remain a contiguous prefix.",
-                        }, status=400)
-                    segments[clip_index]["validated"] = True
-                    # Validating an interrupted Full-Batch candidate commits that
-                    # exact clip. Its transient COMPUTED checkpoint must not stay
-                    # hidden under Validated and reappear after a later unvalidate.
-                    segments[clip_index].pop("computed", None)
-                    # Never allow a stale true flag beyond the first open clip.
-                    open_prefix = False
-                    for i, desc in enumerate(segments):
-                        if open_prefix:
-                            desc["validated"] = False
-                        elif not bool(desc.get("validated", False)):
-                            open_prefix = True
-                else:
-                    for i in range(clip_index, len(segments)):
-                        segments[i]["validated"] = False
-                        # Motion Context is causal. Once clip N is explicitly
-                        # invalidated, no interrupted checkpoint at N or later is
-                        # reusable/truthful anymore, even though its cache files
-                        # may remain on disk for preview/history purposes.
-                        segments[i].pop("computed", None)
+                        return web.json_response({"ok": False, "error": "Clip cache is missing."}, status=409)
+                    return web.json_response({"ok": True, "found": False})
 
-            manifest = dict(manifest)
-            manifest["segments"] = segments
-            manifest["updated_at"] = time.time()
-            _write_json_atomic(manifest_path, manifest)
-            return web.json_response({
-                "ok": True,
-                "found": True,
-                "validated_count": int(
-                    sum(bool(x.get("validated", False)) for x in segments)
-                    if runtime_mode in {"fl2va", "ref2va_independent"}
-                    else _validated_prefix_count(segments)
-                ),
-            })
+                segments = [dict(x) for x in manifest.get("segments", [])]
+                if runtime_mode == "ref2va_independent":
+                    target = None
+                    if clip_id:
+                        target = next((x for x in segments if str(x.get("clip_id") or "") == clip_id), None)
+                    elif 0 <= clip_index < len(segments):
+                        target = segments[clip_index]
+                    if target is not None:
+                        target["validated"] = bool(requested_validated)
+                elif runtime_mode == "fl2va":
+                    # FL2VA validation is random-access except for explicit Previous
+                    # dependencies. Persist the exact manual checkbox state. When an
+                    # upstream plan is invalidated, only the consecutive Previous
+                    # followers reported by the current UI state are invalidated too;
+                    # the first manual follower remains independent. Consuming
+                    # COMPUTED here prevents an interrupted checkpoint from silently
+                    # resurrecting after an explicit manual validation change.
+                    target = None
+                    if clip_id:
+                        target = next(
+                            (x for x in segments if str(x.get("clip_id") or "") == clip_id),
+                            None,
+                        )
+                    elif 0 <= clip_index < len(segments):
+                        target = segments[clip_index]
+                    if target is not None:
+                        if requested_validated:
+                            target["validated"] = True
+                            target.pop("computed", None)
+                        else:
+                            invalidate_ids = {str(target.get("clip_id") or "")}
+                            invalidate_ids.update(
+                                str(x) for x in (body.get("dependent_clip_ids") or []) if str(x)
+                            )
+                            for desc in segments:
+                                if str(desc.get("clip_id") or "") in invalidate_ids:
+                                    desc["validated"] = False
+                                    desc.pop("computed", None)
+                else:
+                    # Ref2VA Motion ON is causal: validation is a contiguous prefix.
+                    # Manual unvalidation clears the selected clip and everything
+                    # after it. Manual validation may only extend the existing
+                    # validated prefix by the selected cached segment.
+                    if clip_index < 0:
+                        return web.json_response({"ok": False, "error": "Invalid clip index."}, status=400)
+                    if clip_index >= len(segments):
+                        # Recovery path for a stale workflow validation flag after the
+                        # physical cache was removed. There is nothing on disk to
+                        # invalidate, so allow manual unvalidation to clear the UI
+                        # state. Validation still requires a real cached segment.
+                        if not requested_validated:
+                            return web.json_response({"ok": True, "found": False})
+                        return web.json_response({"ok": False, "error": "Clip cache is missing."}, status=409)
+                    if clip_id != shots.clip_identity(manifest, clip_index):
+                        return web.json_response({"ok": False, "error": "Cached clip ID differs."}, status=409)
+                    if requested_validated:
+                        card = {"id": clip_id, shots.MOTION: shots.card_motion(body)}
+                        problem = shots.reuse_problem(data_path, manifest, clip_index, card)
+                        if problem:
+                            return web.json_response({"ok": False, "error": problem}, status=409)
+                        if any(not bool(segments[i].get("validated", False)) for i in range(clip_index)):
+                            return web.json_response({
+                                "ok": False,
+                                "error": "Ref2VA Motion Context validation must remain a contiguous prefix.",
+                            }, status=400)
+                        segments[clip_index]["validated"] = True
+                        # Validating an interrupted Full-Batch candidate commits that
+                        # exact clip. Its transient COMPUTED checkpoint must not stay
+                        # hidden under Validated and reappear after a later unvalidate.
+                        segments[clip_index].pop("computed", None)
+                        # Never allow a stale true flag beyond the first open clip.
+                        open_prefix = False
+                        for i, desc in enumerate(segments):
+                            if open_prefix:
+                                desc["validated"] = False
+                            elif not bool(desc.get("validated", False)):
+                                open_prefix = True
+                    else:
+                        for i in range(clip_index, len(segments)):
+                            segments[i]["validated"] = False
+                            # Motion Context is causal. Once clip N is explicitly
+                            # invalidated, no interrupted checkpoint at N or later is
+                            # reusable/truthful anymore, even though its cache files
+                            # may remain on disk for preview/history purposes.
+                            segments[i].pop("computed", None)
+
+                manifest = dict(manifest)
+                manifest["segments"] = segments
+                manifest["updated_at"] = time.time()
+                _write_json_atomic(manifest_path, manifest)
+                return web.json_response({
+                    "ok": True,
+                    "found": True,
+                    "validated_count": int(
+                        sum(bool(x.get("validated", False)) for x in segments)
+                        if runtime_mode in {"fl2va", "ref2va_independent"}
+                        else _validated_prefix_count(segments)
+                    ),
+                })
         except Exception as exc:
             _LOG.exception("H3 validation persistence failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
@@ -5623,10 +5677,13 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 "motion_context": False if is_independent else True,
                 "cached_count": int(len(segments)),
                 "validated_count": int(validated_count),
+                "recorded_incoming_motion": (
+                    [] if is_random_access else [shots.recorded_motion(desc, i) for i, desc in enumerate(segments)]
+                ),
                 "cached_clip_ids": (
                     [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "")]
                     if is_random_access
-                    else [str(x) for x in list(manifest.get("extender_clip_ids") or [])[:len(segments)] if str(x)]
+                    else [shots.clip_identity(manifest, i) for i in range(len(segments))]
                 ),
                 "validated_clip_ids": (
                     [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "") and bool(x.get("validated", False))]
@@ -5902,6 +5959,10 @@ def _finish_final_decode_and_autosave(
             info.update({"relayvsr_x2_ready": False, "relayvsr_x2_error": str(exc)})
         # Relay processing cannot replace the H3 VIDEO output before success.
     if info is not None:
+        if cache.get("manifest_path"):
+            manifest = _load_manifest_from_paths(data_path, cache["manifest_path"])
+            if manifest and manifest.pop("shot_preview_needs_rebuild", False):
+                _write_json_atomic(cache["manifest_path"], manifest)
         effective_settings = dict(autosave_settings) if autosave_settings else autosave_settings
         if relay_failed and effective_settings is not None:
             # Save H3 even on an interrupted upscale; never package an old Relay.
@@ -5912,6 +5973,14 @@ def _finish_final_decode_and_autosave(
     if interrupted_exception is not None:
         raise interrupted_exception
     return result
+
+
+def _lock_final_decode(function):
+    @functools.wraps(function)
+    def decode(self, cache, *args, **kwargs):
+        with shots.cache_access(cache["data_path"]):
+            return function(self, cache, *args, **kwargs)
+    return decode
 
 
 class MiniMaxH3MotionContextDiskFinalDecode:
@@ -5955,6 +6024,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
     CATEGORY = "MiniMax H3"
     OUTPUT_NODE = True
 
+    @_lock_final_decode
     def export(
         self,
         cache,

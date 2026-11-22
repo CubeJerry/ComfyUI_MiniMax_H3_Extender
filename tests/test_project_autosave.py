@@ -1,4 +1,5 @@
 """CPU-only autosave orchestration tests; disk archives use a small test writer."""
+from contextlib import nullcontext
 import ast
 import copy
 import functools
@@ -37,6 +38,9 @@ class Autosave(unittest.TestCase):
             exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'settings', 'exec'), self.ns)
         load_functions('fl2va_engine.py', {'normalize_mode'}, self.ns)
         self.ns['_normalize_generation_mode'] = self.ns['normalize_mode']
+        self.ns['shots'] = types.SimpleNamespace(cache_access=lambda *paths: nullcontext())
+        self.ns['_chain_paths'] = lambda owner: (self.root/owner, self.root/(owner+'.json'))
+        self.ns['_project_cache_owner_id'] = lambda owner, mode, motion: owner
         self.ns['_clips_from_project_payload'] = lambda p: json.loads(p['extender']['clips_json'])['clips']
         self.calls = []
         def writer(owner, name, payload, output):
@@ -173,16 +177,23 @@ class Autosave(unittest.TestCase):
         ns = {'CACHE_TYPE': 'CACHE'}
         exec(compile(ast.Module(body=[method], type_ignores=[]), 'schema', 'exec'), ns)
         required = ns['INPUT_TYPES'](None)['required']
-        self.assertEqual(list(required)[-1], 'auto_save_project')
+        self.assertEqual(list(required)[10:13], ['autoplay', 'auto_save_project', 'save_individual_clips'])
         self.assertIs(required['auto_save_project'][1]['default'], False)
-        for filename, function in [('motion_context_disk.py', 'export'), ('fl2va_engine.py', 'export_fl2va_final')]:
-            module = ast.parse((ROOT/filename).read_text())
-            node = next(n for n in ast.walk(module) if isinstance(n, ast.FunctionDef) and n.name == function)
-            arg_names = [arg.arg for arg in node.args.args]
-            self.assertIn("auto_save_project" if function == "export" else "project_autosave_settings", arg_names)
-            text = ast.unparse(node)
-            self.assertLess(text.index('_embed_final_metadata_in_place(output_path'), text.index('_maybe_auto_save_project('))
-            self.assertLess(text.index('_maybe_auto_save_project('), text.index('**project_autosave_info'))
+        # All modes now finish through the shared post-Relay autosave hook.
+        ns = {'_finish_with_optional_relay': lambda result, **kwargs: result,
+              '_maybe_auto_save_project': self.gate}
+        load_functions('motion_context_disk.py', {'_finish_final_decode_and_autosave'}, ns)
+        video = self.root / 'finished.mp4'
+        video.write_bytes(b'finished video')
+        for mode, motion in [('ref2va', True), ('ref2va', False), ('fl2va', False)]:
+            cache = self.capture(mode, motion)
+            result = {'ui': {'h3_preview_info': [{}]}}
+            ns['_finish_final_decode_and_autosave'](
+                result, cache=cache, original_path=video, data_path=video, unique_id='8',
+                fps=24, workflow=None, prompt=None, relay_enabled=False, relay_requested=False,
+                autosave_settings={'auto_save_project': True}, clip_count=1, frame_count=241)
+            self.assertIn('project_autosave_path', result['ui']['h3_preview_info'][0])
+            video.with_suffix('.ext').unlink()
 
 if __name__ == '__main__':
     unittest.main()
